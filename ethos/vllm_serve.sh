@@ -1,0 +1,56 @@
+﻿#!/usr/bin/env bash
+set -e
+MODEL="$1"
+PORT="$2"
+KV_CACHE="${3:-auto}"
+export DEBIAN_FRONTEND=noninteractive
+command -v curl >/dev/null || (apt-get update -qq && apt-get install -y -qq curl ca-certificates)
+command -v gcc  >/dev/null || (apt-get update -qq && apt-get install -y -qq build-essential)
+export PATH="$HOME/.local/bin:$PATH"
+command -v uv >/dev/null || (curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null)
+export PATH="$HOME/.local/bin:$PATH"
+V="$HOME/.ethos-vllm"
+[ -x "$V/bin/python" ] || uv venv --python 3.12 "$V"
+"$V/bin/python" -c 'import vllm' 2>/dev/null || uv pip install -q --python "$V/bin/python" vllm
+"$V/bin/python" -c 'import bitsandbytes' 2>/dev/null || uv pip install -q --python "$V/bin/python" bitsandbytes
+
+if [ -z "$MODEL" ] || [ "$MODEL" = "setup" ]; then
+  echo "vllm ready in WSL ($("$V/bin/python" -c 'import vllm;print(vllm.__version__)'))."
+  exit 0
+fi
+
+case "$MODEL" in
+  /mnt/*)
+    DEST="$HOME/.ethos-models/$(basename "$MODEL")"
+    if [ ! -d "$DEST" ]; then
+      echo "copying model to WSL filesystem (one-time, large) ..."
+      mkdir -p "$HOME/.ethos-models"
+      cp -r "$MODEL" "$DEST.partial" && mv "$DEST.partial" "$DEST"
+    fi
+    MODEL="$DEST"
+    ;;
+esac
+
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
+QUANT="--quantization bitsandbytes"
+MAXLEN=8192
+FREE_MB=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')
+SIZE_B=$(du -sb "$MODEL" 2>/dev/null | cut -f1)
+if [ -n "$FREE_MB" ] && [ -n "$SIZE_B" ] && [ "$((FREE_MB * 1000000))" -gt "$((SIZE_B + 3000000000))" ]; then
+  QUANT=""
+  MAXLEN=32768
+fi
+echo "weight quant: ${QUANT:-bf16} (free ${FREE_MB}MB)"
+KV_ARGS=()
+if [ -n "$KV_CACHE" ] && [ "$KV_CACHE" != "auto" ] && [ "$KV_CACHE" != "bf16" ] && [ "$KV_CACHE" != "bfloat16" ]; then
+  KV_ARGS=(--kv-cache-dtype "$KV_CACHE")
+  echo "kv cache: $KV_CACHE"
+else
+  echo "kv cache: vllm default"
+fi
+
+exec "$V/bin/python" -m vllm.entrypoints.openai.api_server \
+  --model "$MODEL" --served-model-name ethos --host 0.0.0.0 --port "$PORT" \
+  $QUANT "${KV_ARGS[@]}" --enforce-eager \
+  --gpu-memory-utilization 0.90 --max-model-len "$MAXLEN"

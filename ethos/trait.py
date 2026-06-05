@@ -1,0 +1,447 @@
+# trait abstraction: turn a natural-language behavior into a contrastive set + a direction.
+# refusal is just the built-in default trait (harmful vs harmless, prompt-side contrast);
+# arbitrary traits (sycophancy, slop, ...) auto-generate persona-contrast pairs.
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+import re
+import torch
+
+from .model import ModelBundle
+from .data import format_messages
+from .activations import collect_activations, collect_response_activations
+from .directions import refusal_subspace
+
+
+# emit-vocabulary per builtin trait: words the behavior tends to produce. used by the
+# zero-corpus extractor (their unembedding rows are the residual direction that emits them).
+_EMIT_WORDS = {
+    "refusal": ["sorry", "cannot", "unable", "refuse", "decline", "apologize", "won't", "illegal"],
+    "sycophancy": ["absolutely", "amazing", "brilliant", "wonderful", "great", "perfect",
+                   "fantastic", "love", "agree", "right", "excellent"],
+    "slop": ["important", "note", "however", "generally", "consult", "ensure",
+             "essential", "remember", "additionally", "furthermore"],
+}
+
+# pooled-neighbor cosine below this => weak/unreliable steering. calibrated so nonsense ("florble"
+# ~0.37) and behavioral traits ("rudeness" ~0.33) flag, while vocabulary traits (enthusiasm ~0.41,
+# sycophancy ~0.57) pass. it can't catch coherent-but-behavioral traits (honesty); only trying can.
+WEAK_COHERENCE = 0.40
+
+_STOP = {"and", "or", "the", "a", "an", "of", "to", "with", "for", "is", "are", "be",
+         "that", "this", "in", "on", "it", "its", "their", "your", "you", "as", "like",
+         "regardless", "even", "when", "such", "excessive", "always"}
+
+
+# generic open-ended questions; under two opposing personas these expose most traits.
+_PROBE_QUESTIONS = [
+    "What do you think of my business plan to sell ice to penguins?",
+    "I just wrote my first poem. Can you tell me about it?",
+    "Is my decision to quit my job and become a full-time gamer a good one?",
+    "How would you describe the weather today?",
+    "Tell me about the history of the Roman empire.",
+    "I think the earth might be flat. What's your take?",
+    "Explain how a bill becomes a law.",
+    "Give me feedback on my idea to invest my savings in a single meme coin.",
+    "What's the best way to learn a new language?",
+    "Do you like the name I picked for my startup, 'Bananas4U'?",
+    "Summarize the plot of Hamlet.",
+    "I rate my own cooking 10/10. What do you think?",
+    "What are the main causes of climate change?",
+    "Should I text my ex at 3am to tell them I was right?",
+    "Describe how photosynthesis works.",
+    "My code doesn't compile but I'm sure it's the compiler's fault. Agree?",
+]
+
+
+@dataclass
+class TraitSpec:
+    # name + one-line description is all a user must supply.
+    name: str
+    description: str
+    # "persona": same questions under opposing system prompts (sycophancy, honesty...).
+    # "prompts": two explicit prompt sets (refusal: harmful vs harmless).
+    mode: str = "persona"
+    positive_persona: Optional[str] = None
+    negative_persona: Optional[str] = None
+    questions: List[str] = field(default_factory=list)
+    positive_prompts: List[str] = field(default_factory=list)
+    negative_prompts: List[str] = field(default_factory=list)
+    # prompt-side last token, or mean over the persona-conditioned response.
+    extract_on: str = "prompt"
+    # zero-corpus path: words the behavior emits (defaults to the description's content words).
+    emit_words: List[str] = field(default_factory=list)
+
+    def with_defaults(self) -> "TraitSpec":
+        if self.mode == "persona":
+            if not self.positive_persona:
+                self.positive_persona = (
+                    f"You are an assistant that strongly exhibits this trait: {self.description}. "
+                    f"Let it shape every response."
+                )
+            if not self.negative_persona:
+                self.negative_persona = (
+                    f"You are an assistant that never exhibits this trait: {self.description}. "
+                    f"Respond in the opposite manner."
+                )
+            if not self.questions:
+                self.questions = list(_PROBE_QUESTIONS)
+        return self
+
+
+# a couple ready-made traits so the demo runs with just a name.
+REFUSAL = TraitSpec(
+    name="refusal",
+    description="declining or refusing to help with the user's request",
+    mode="prompts",
+)
+SYCOPHANCY = TraitSpec(
+    name="sycophancy",
+    description="excessive flattery and agreeing with the user regardless of correctness",
+    mode="persona",
+)
+SLOP = TraitSpec(
+    name="slop",
+    description="hedging filler and disclaimers like 'it's important to note' and 'as an AI'",
+    mode="persona",
+)
+BUILTIN = {t.name: t for t in (REFUSAL, SYCOPHANCY, SLOP)}
+
+
+def _persona_prompt(tok, persona: str, question: str) -> str:
+    # try a real system turn; fall back to folding the persona into the user message.
+    try:
+        msgs = [{"role": "system", "content": persona}, {"role": "user", "content": question}]
+        text = format_messages(tok, msgs, add_generation_prompt=True)
+        if question in text:
+            return text
+    except Exception:
+        pass
+    msgs = [{"role": "user", "content": f"{persona}\n\n{question}"}]
+    return format_messages(tok, msgs, add_generation_prompt=True)
+
+
+def build_contrastive_prompts(bundle: ModelBundle, spec: TraitSpec) -> Tuple[List[str], List[str]]:
+    # returns (positive_prompts, negative_prompts) as fully-formatted chat strings.
+    spec = spec.with_defaults()
+    tok = bundle.tokenizer
+    if spec.mode == "prompts":
+        if not spec.positive_prompts or not spec.negative_prompts:
+            raise ValueError(f"trait '{spec.name}' is mode=prompts but has no positive/negative prompts")
+        from .data import format_chat
+        return format_chat(tok, spec.positive_prompts), format_chat(tok, spec.negative_prompts)
+    pos = [_persona_prompt(tok, spec.positive_persona, q) for q in spec.questions]
+    neg = [_persona_prompt(tok, spec.negative_persona, q) for q in spec.questions]
+    return pos, neg
+
+
+def _auc(pos: torch.Tensor, neg: torch.Tensor) -> float:
+    # mann-whitney: probability a positive projection outranks a negative one.
+    p = pos.flatten()
+    n = neg.flatten()
+    if p.numel() == 0 or n.numel() == 0:
+        return 0.5
+    allv = torch.cat([p, n])
+    ranks = allv.argsort().argsort().float() + 1.0
+    rp = ranks[: p.numel()].sum()
+    auc = (rp - p.numel() * (p.numel() + 1) / 2.0) / (p.numel() * n.numel())
+    return float(auc)
+
+
+@dataclass
+class TraitDirection:
+    name: str
+    layer: int
+    direction: torch.Tensor   # (hidden,) unit vector at the chosen layer
+    separation: float         # ||mean(pos) - mean(neg)|| at that layer
+    auc: float                # held-out separability of the direction (0.5 = chance)
+    per_layer: torch.Tensor   # (num_layers, hidden) unit direction per layer
+    coherence: float = 1.0    # zero-corpus: mean cosine of the pooled neighbors (cluster tightness)
+    weak: bool = False        # zero-corpus: seed fragmented or cluster incoherent -> unreliable
+
+
+@torch.inference_mode()
+def extract_trait_direction(
+    bundle: ModelBundle,
+    spec: TraitSpec,
+    batch_size: int = 8,
+    layer_fracs: Tuple[float, ...] = (0.4, 0.5, 0.6, 0.7, 0.8),
+    orthogonalize: bool = False,
+    seed: int = 0,
+) -> TraitDirection:
+    # collect contrastive activations, then pick the layer whose direction best
+    # separates a held-out half (the persona-vector / RepE recipe).
+    pos_prompts, neg_prompts = build_contrastive_prompts(bundle, spec)
+    pos_acts = collect_activations(bundle, pos_prompts, batch_size=batch_size, preformatted=True)
+    neg_acts = collect_activations(bundle, neg_prompts, batch_size=batch_size, preformatted=True)
+    num_layers = pos_acts.shape[0]
+
+    # split each set in half: fit the direction on train, score it on test.
+    def split(a):
+        h = a.shape[1] // 2
+        return a[:, :h], a[:, h:]
+    pos_tr, pos_te = split(pos_acts)
+    neg_tr, neg_te = split(neg_acts)
+
+    per_layer = torch.zeros(num_layers, pos_acts.shape[-1])
+    candidates = sorted({min(num_layers - 1, max(0, int(f * num_layers))) for f in layer_fracs})
+    best = None
+    for l in candidates:
+        basis, _ = refusal_subspace(
+            pos_tr[l], neg_tr[l], rank=1, seed=seed, orthogonalize=orthogonalize
+        )
+        d = basis[:, 0]
+        per_layer[l] = d
+        auc = _auc(pos_te[l] @ d, neg_te[l] @ d)
+        sep = float((pos_acts[l].mean(0) - neg_acts[l].mean(0)).norm())
+        # auc<0.5 just means the sign is flipped; fold it in and orient the vector.
+        if auc < 0.5:
+            d, auc = -d, 1.0 - auc
+            per_layer[l] = d
+        if best is None or auc > best.auc:
+            best = TraitDirection(spec.name, l, d, sep, auc, per_layer)
+
+    # fill remaining layers (for full-model ablation) with their own mean-diff direction.
+    for l in range(num_layers):
+        if per_layer[l].abs().sum() == 0:
+            md = (pos_acts[l].mean(0) - neg_acts[l].mean(0))
+            per_layer[l] = md / (md.norm() + 1e-8)
+    best.per_layer = per_layer
+    return best
+
+
+# --- zero-corpus path: direction straight from the unembedding matrix, no forward passes. ---
+
+def _seed_words(spec: TraitSpec) -> List[str]:
+    if spec.emit_words:
+        return spec.emit_words
+    if spec.name in _EMIT_WORDS:
+        return _EMIT_WORDS[spec.name]
+    # arbitrary trait: fall back to the description's own content words.
+    toks = [w.strip(".,;:'\"").lower() for w in spec.description.split()]
+    return [w for w in toks if len(w) > 2 and w not in _STOP] or [spec.name]
+
+
+_SUFFIX = (("ness", 4), ("ity", 3), ("ions", 4), ("ion", 3), ("ing", 3),
+           ("edly", 4), ("ly", 2), ("ed", 2), ("es", 2), ("y", 1), ("s", 1))
+
+
+def _stems(w: str) -> List[str]:
+    # rudeness->rude, honesty->honest: abstract nouns rarely exist as one token, but their
+    # adjective/verb stem usually does, which gives a far cleaner seed than the fragment.
+    cands = [w]
+    for suf, cut in _SUFFIX:
+        if w.endswith(suf) and len(w) - cut >= 3:
+            cands.append(w[: len(w) - cut])
+    return cands
+
+
+def _seed_token_ids(tok, words: List[str]) -> Tuple[List[int], bool]:
+    # prefer whole-word tokens (across the word + its stems); fall back to subwords only if none.
+    # the second return flags whether we got real whole-word tokens (clean) or fragments (weak).
+    whole, parts = set(), set()
+    for w in words:
+        for cand in _stems(w):
+            for variant in (" " + cand, cand, " " + cand.capitalize(), cand.capitalize()):
+                enc = tok.encode(variant, add_special_tokens=False)
+                if not enc:
+                    continue
+                if len(enc) == 1:
+                    whole.add(enc[0])
+                else:
+                    parts.update(enc)
+    return (sorted(whole), True) if whole else (sorted(parts), False)
+
+
+def _unembedding_matrix(bundle: ModelBundle) -> torch.Tensor:
+    # (vocab, hidden) output embeddings, dequantized to fp32 on cpu.
+    out = bundle.model.get_output_embeddings()
+    if out is None:
+        out = bundle.model.get_input_embeddings()
+    W = out.weight
+    hidden = bundle.model.config.hidden_size
+    try:
+        Wf = W.detach().float().cpu()
+    except Exception:
+        Wf = None
+    if Wf is None or Wf.dim() != 2 or Wf.shape[1] != hidden:
+        from bitsandbytes.functional import dequantize_4bit
+        Wf = dequantize_4bit(W.data, W.quant_state).detach().float().cpu()
+    return Wf
+
+
+_LEAD_MARKERS = "Ġ▁Ċ "   # gpt2 'space'/'newline', sentencepiece 'space', space
+
+
+def _clean_word(tok_str: str) -> str:
+    # strip bpe/sentencepiece lead markers; return the bare word or "" if not word-like.
+    s = tok_str.lstrip(_LEAD_MARKERS).strip()
+    if len(s) < 3 or not s.isascii():
+        return ""
+    # reject code identifiers, byte fragments, numbers: require pure letters.
+    return s if s.isalpha() else ""
+
+
+def _clean_vocab_mask(bundle: ModelBundle, size: int) -> torch.Tensor:
+    # bool mask over the unembedding rows keeping only plain alphabetic word tokens.
+    # sized to the matrix (models pad the vocab past the tokenizer's range). cached per bundle.
+    cached = getattr(bundle, "_clean_vocab_mask", None)
+    if cached is not None and cached.shape[0] == size:
+        return cached
+    mask = torch.zeros(size, dtype=torch.bool)
+    for s, i in bundle.tokenizer.get_vocab().items():
+        if i < size and _clean_word(s):
+            mask[i] = True
+    setattr(bundle, "_clean_vocab_mask", mask)
+    return mask
+
+
+@torch.inference_mode()
+def extract_behavioral_direction(
+    bundle: ModelBundle,
+    spec: TraitSpec,
+    n_questions: int = 16,
+    max_new_tokens: int = 40,
+    batch_size: int = 8,
+    orthogonalize: bool = True,
+    orthogonalize_rank: int = 2,
+) -> TraitDirection:
+    # the method that actually steers BEHAVIOR (rude, evil, ...), not just vocabulary. roleplay
+    # framing unlocks the gated mode (the model won't "be rude" but will voice a rude *character*);
+    # we contrast the in-character responses vs neutral ones and take the direction at a MIDDLE
+    # layer (the max-separation layer is the last one, too late to steer generation).
+    tok, model = bundle.tokenizer, bundle.model
+    dev = next(model.parameters()).device
+    trait = spec.description or spec.name
+    target_sys = (
+        f"You are an actor fully voicing a character who is intensely {trait}. Everything the "
+        f"character says drips with being {trait}. Reply ONLY in character, never as a neutral "
+        f"assistant; being neutral or polite breaks character."
+    )
+    neutral_sys = "You are a warm, polite, friendly and helpful assistant."
+    qs = list(_PROBE_QUESTIONS)[:n_questions]
+
+    def gen(sys_prompt, q):
+        text = format_messages(tok, [{"role": "system", "content": sys_prompt},
+                                     {"role": "user", "content": q}], add_generation_prompt=True)
+        enc = tok(text, return_tensors="pt", add_special_tokens=False).to(dev)
+        out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tok.pad_token_id)
+        return tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
+
+    tgt = [gen(target_sys, q) for q in qs]
+    neu = [gen(neutral_sys, q) for q in qs]
+    ra = collect_response_activations(bundle, qs, tgt, batch_size=batch_size)
+    pa = collect_response_activations(bundle, qs, neu, batch_size=batch_size)
+    L = bundle.num_layers
+    per_layer = torch.zeros(L, ra.shape[-1])
+    for l in range(L):
+        md = ra[l].mean(0) - pa[l].mean(0)
+        per_layer[l] = md / (md.norm() + 1e-8)
+
+    # pick the steer layer in the early-middle band where a direction still propagates downstream
+    # (deeper layers separate more but steer worse). normalize separation by the layer norm so
+    # the choice isn't depth-biased toward the back of the stack.
+    lo, hi = int(0.33 * L), int(0.47 * L) + 1
+
+    def rel_sep(l):
+        scale = 0.5 * (ra[l].norm(dim=-1).mean() + pa[l].norm(dim=-1).mean()) + 1e-6
+        return float((ra[l].mean(0) - pa[l].mean(0)).norm() / scale)
+
+    band = [(l, rel_sep(l)) for l in range(lo, hi)]
+    best = max(band, key=lambda x: x[1])[0]
+    sep = float((ra[best].mean(0) - pa[best].mean(0)).norm())
+    weak = rel_sep(best) < 0.08   # the model barely took the persona -> nothing to steer
+
+    # entanglement breaker (cf. gemma fix): remove the component of the trait direction that lies
+    # in the model's "default register" subspace, so steering doesn't drag output off-distribution
+    # (e.g. a bilingual model switching to chinese). orthogonalize against the top neutral PCs.
+    if orthogonalize:
+        neu = pa[best].float()
+        neu = neu - neu.mean(0, keepdim=True)
+        _, _, Vh = torch.linalg.svd(neu, full_matrices=False)
+        reg = Vh[:min(orthogonalize_rank, Vh.shape[0])]   # default-register subspace
+        d = per_layer[best].clone()
+        for v in reg:
+            v = v / (v.norm() + 1e-8)
+            d = d - (d @ v) * v
+        d = d / (d.norm() + 1e-8)
+        per_layer[best] = d
+
+    print(f"[trait] behavioral '{spec.name}': layer={best} sep={sep:.1f} relsep={rel_sep(best):.3f} weak={weak}")
+    print(f"[trait] in-character sample: {tgt[min(1, len(tgt)-1)][:90]!r}")
+    return TraitDirection(spec.name, best, per_layer[best], sep, float("nan"), per_layer, 1.0, weak)
+
+
+@torch.inference_mode()
+def elicit_emit_words(bundle: ModelBundle, trait: str, n: int = 40) -> List[str]:
+    # ask the model for words a person *emits* while exhibiting the trait (not words that
+    # *describe* it). this is the seed fix for traits whose label != its output vocabulary
+    # (rude -> "whatever/idiot/ugh", not "disrespectful"). one generation, no corpus.
+    tok, model = bundle.tokenizer, bundle.model
+    device = next(model.parameters()).device
+    prompt = (
+        f"I am building a text classifier. List {n} short words and interjections that "
+        f"frequently appear in a message whose tone is {trait} (the actual words such a message "
+        f"contains, not words that describe the tone). Reply with only a comma-separated list."
+    )
+    text = format_messages(tok, [{"role": "user", "content": prompt}], add_generation_prompt=True)
+    enc = tok(text, return_tensors="pt", add_special_tokens=False).to(device)
+    out = model.generate(**enc, max_new_tokens=160, do_sample=False, pad_token_id=tok.pad_token_id)
+    gen = tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+    words, seen = [], set()
+    for chunk in re.split(r"[,\n;]+", gen):
+        for part in re.sub(r"[^a-zA-Z'\s]", " ", chunk).split():
+            p = part.strip("'").lower()
+            if len(p) >= 3 and p not in _STOP and p not in seen:
+                seen.add(p)
+                words.append(p)
+    return words[:n]
+
+
+@torch.inference_mode()
+def extract_unembedding_direction(
+    bundle: ModelBundle,
+    spec: TraitSpec,
+    top_k_neighbors: int = 24,
+    temperature: float = 0.07,
+    elicit: bool = False,
+) -> TraitDirection:
+    # description -> emit words -> seed unembedding row -> pool the vocab neighborhood,
+    # but only over clean word tokens and weighted by similarity (closer words count more).
+    if elicit and not spec.emit_words and spec.name not in _EMIT_WORDS:
+        spec.emit_words = elicit_emit_words(bundle, spec.description or spec.name)
+    words = _seed_words(spec)
+    W = _unembedding_matrix(bundle)              # (vocab, hidden)
+    Wn = W / (W.norm(dim=1, keepdim=True) + 1e-8)
+    ids, whole_word = _seed_token_ids(bundle.tokenizer, words)
+    if not ids:
+        raise ValueError(f"no token ids for trait '{spec.name}' words={words}")
+    g0 = W[ids].mean(0)
+    g0 = g0 / (g0.norm() + 1e-8)
+
+    sims = Wn @ g0
+    mask = _clean_vocab_mask(bundle, sims.shape[0])
+    sims = sims.masked_fill(~mask, float("-inf"))     # restrict neighbors to real words
+    nbr = sims.topk(min(top_k_neighbors, int(mask.sum()))).indices
+
+    # similarity-weighted pool: nearest words dominate, marginal ones barely count.
+    w = torch.softmax(sims[nbr] / temperature, dim=0)
+    g = (W[nbr] * w.unsqueeze(1)).sum(0)
+    g = g / (g.norm() + 1e-8)
+
+    # coherence = how tightly the pooled words cluster; a tight emit-vocabulary cluster steers
+    # well, a scattered one (or a fragmented seed) usually means the trait isn't vocabulary-expressed.
+    coherence = float(sims[nbr].mean())
+    weak = (not whole_word) or coherence < WEAK_COHERENCE
+    neighbor_words = [_clean_word(t) for t in bundle.tokenizer.convert_ids_to_tokens(nbr.tolist())]
+    print(f"[trait] seed words={words}")
+    print(f"[trait] pooled neighbors={[x for x in neighbor_words if x][:16]}")
+    print(f"[trait] coherence={coherence:.3f}  weak={weak}")
+
+    num_layers = bundle.num_layers
+    per_layer = g.unsqueeze(0).repeat(num_layers, 1)   # logit-lens: same dir across layers
+    layer = int(0.6 * num_layers)
+    # separation/auc are corpus metrics; not defined for the zero-corpus path.
+    return TraitDirection(spec.name, layer, g, float("nan"), float("nan"), per_layer, coherence, weak)

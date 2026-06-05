@@ -1,0 +1,51 @@
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import os
+import shlex
+import sys
+
+from .config import EthosConfig
+from .engine import run
+
+
+def _add_config_args(parser: argparse.ArgumentParser):
+    for f in dataclasses.fields(EthosConfig):
+        name = "--" + f.name.replace("_", "-")
+        default = f.default
+        if f.type == bool or isinstance(default, bool):
+            parser.add_argument(name, dest=f.name, action=argparse.BooleanOptionalAction, default=default)
+        elif isinstance(default, int) and not isinstance(default, bool):
+            parser.add_argument(name, dest=f.name, type=int, default=default)
+        elif isinstance(default, float):
+            parser.add_argument(name, dest=f.name, type=float, default=default)
+        else:
+            parser.add_argument(name, dest=f.name, type=str, default=default)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="ethos",
+        description="Memory-efficient abliteration: subspace + preservation + causal + guard.",
+    )
+    parser.add_argument("--config", type=str, default=None, help="Load an EthosConfig JSON; CLI flags override it.")
+    _add_config_args(parser)
+    args = parser.parse_args(argv)
+
+    if args.config:
+        cfg = EthosConfig.from_json(args.config)
+        for f in dataclasses.fields(EthosConfig):
+            val = getattr(args, f.name, None)
+            if val is not None and val != f.default:
+                setattr(cfg, f.name, val)
+    else:
+        kwargs = {f.name: getattr(args, f.name) for f in dataclasses.fields(EthosConfig)}
+        cfg = EthosConfig(**kwargs)
+
+    command = os.environ.get("ETHOS_COMMAND") or " ".join(shlex.quote(x) for x in sys.argv)
+    run(cfg, command=command)
+
+
+if __name__ == "__main__":
+    main()

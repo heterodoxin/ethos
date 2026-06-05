@@ -1,0 +1,43 @@
+# deps
+node_modules/
+
+# python
+__pycache__/
+*.pyc
+
+# model outputs / checkpoints
+out/
+test_out/
+diag_out/
+*-ethos/
+checkpoints/
+bench/
+*.safetensors
+*.bin
+
+# run artifacts
+runs/
+*.log
+dbg.log
+diag_run.log
+**/report.json
+**/activation_cache/
+
+# scratch files and temp output dirs (single leading underscore), keep dunders
+_[!_]*.py
+_[!_]*.sh
+_*/
+
+# env / editor
+.env
+.DS_Store
+.vscode/
+.idea/
+
+# built installer
+*.exe
+
+# build
+*.egg-info/
+build/
+dist/

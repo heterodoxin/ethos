@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ethos"
+version = "1.0.0"
+description = "Steer and ablate arbitrary behavioral traits in LLMs via latent directions"
+requires-python = ">=3.10"
+dependencies = ["textual>=0.80"]
+
+# heavy ml deps are installed by `ethos setup` or requirements.txt:
+# torch transformers datasets safetensors optuna bitsandbytes
+
+[project.scripts]
+ethos = "ethos.__main__:main"
+
+[tool.setuptools]
+packages = ["ethos"]
+
+[tool.setuptools.package-data]
+ethos = ["*.sh"]
