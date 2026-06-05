@@ -3,18 +3,8 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/JR6hMmJNuB)
 
-```
-       /\
-      /__\
-     /\  /\
-    /__\/__\
-   /\      /\
-  /__\    /__\
- /\  /\  /\  /\
-/__\/__\/__\/__\
-```
 
-# ethos
+# Ethos
 
 trait control for language models. name a behavior in plain english and ethos finds its direction inside the model, so you can turn it up, down, or bake it into a model anyone can download. no finetuning.
 
