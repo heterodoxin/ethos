@@ -41,3 +41,12 @@ _*/
 *.egg-info/
 build/
 dist/
+
+# local test / eval / demo scripts (not part of the package)
+eval100.py
+traits_sweep.py
+strength_test.py
+trait_demo.py
+*_sweep.py
+*_test.py
+*_demo.py
