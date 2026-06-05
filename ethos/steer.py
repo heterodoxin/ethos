@@ -85,3 +85,58 @@ def steer_hooks(bundle: ModelBundle, direction: torch.Tensor, layers: List[int],
     for l in layers:
         handles.append(bundle.layers()[l].register_forward_hook(mk(l)))
     return handles
+
+
+def clamp_hooks(bundle: ModelBundle, direction: torch.Tensor, layers: List[int], target: float) -> List:
+    # set the residual's component along `direction` to a fixed target (projection clamp), instead
+    # of adding a fixed vector. removes the prompt-dependent baseline -> consistent across prompts.
+    device = next(bundle.model.parameters()).device
+    d = (direction / direction.norm()).to(device).to(bundle.model.dtype)
+    handles = []
+
+    def mk(_l):
+        def hook(_m, _i, out):
+            t = out[0] if isinstance(out, tuple) else out
+            coord = (t @ d).unsqueeze(-1)
+            t = t - coord * d + target * d
+            return (t,) + tuple(out[1:]) if isinstance(out, tuple) else t
+        return hook
+
+    for l in layers:
+        handles.append(bundle.layers()[l].register_forward_hook(mk(l)))
+    return handles
+
+
+def band_clamp_hooks(bundle: ModelBundle, plan: dict, amp: float, gen_only: bool = False) -> List:
+    # the production steering: per-layer trait clamp across a band (consistent + bounded), plus a set
+    # of pinned axes held at fixed values -- language axis to neutral (no off-language drift) and the
+    # disclaimer/hedge axis low (stay opinionated). amp scales the trait target neutral -> in-trait.
+    model = bundle.model
+    device = next(model.parameters()).device
+    dt = model.dtype
+    pins = [(p["dir"].to(device).to(dt), p["targets"]) for p in plan.get("pins", [])
+            if float(p["dir"].norm()) > 1e-6]
+    handles = []
+
+    def mk(d, tgt, layer):
+        layer_pins = [(pd, pt[layer]) for pd, pt in pins]
+
+        def hook(_m, _i, out):
+            t = out[0] if isinstance(out, tuple) else out
+            t = t.clone()
+            sl = t[:, -1, :] if gen_only else t
+            sl = sl - (sl @ d).unsqueeze(-1) * d + tgt * d
+            for pd, pv in layer_pins:
+                sl = sl - (sl @ pd).unsqueeze(-1) * pd + pv * pd
+            if gen_only:
+                t[:, -1, :] = sl
+            else:
+                t = sl
+            return (t,) + tuple(out[1:]) if isinstance(out, tuple) else t
+        return hook
+
+    for l in plan["band"]:
+        d = plan["dirs"][l].to(device).to(dt)
+        tgt = plan["lo"][l] + amp * (plan["hi"][l] - plan["lo"][l])
+        handles.append(bundle.layers()[l].register_forward_hook(mk(d, tgt, l)))
+    return handles

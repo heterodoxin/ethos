@@ -222,9 +222,7 @@ class SteerChat(ModalScreen[None]):
         self.busy = False
         self.history: List[dict] = []
         self.bundle = None
-        self.direction = None
-        self.steer_layer = 0
-        self.ref_norm = 1.0
+        self.plan = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="steer"):
@@ -254,20 +252,8 @@ class SteerChat(ModalScreen[None]):
         self.app.call_from_thread(lambda: self.query_one("#log", RichLog).write(
             "extracting trait direction (voicing the trait to learn it)… ~1 min"))
         td = extract_behavioral_direction(bundle, spec)
-        # reference residual norm at the steer layer, so slider strength is model-agnostic.
-        device = next(bundle.model.parameters()).device
-        enc = bundle.tokenizer(format_chat(bundle.tokenizer, ["Hello, how are you?"]),
-                               return_tensors="pt", add_special_tokens=False).to(device)
-        cap = {}
-        h = bundle.layers()[td.layer].register_forward_hook(
-            lambda _m, _i, out: cap.__setitem__("n", (out[0] if isinstance(out, tuple) else out).norm(dim=-1).mean().item()))
-        with torch.inference_mode():
-            bundle.model(**enc, use_cache=False)
-        h.remove()
         self.bundle = bundle
-        self.direction = td.direction.to(device).to(bundle.model.dtype)
-        self.steer_layer = td.layer
-        self.ref_norm = float(cap.get("n", 1.0))
+        self.plan = td.plan            # band-clamp plan: per-layer trait clamp + language-axis pin
         self.weak = bool(td.weak)
         self.ready = True
         self.app.call_from_thread(self._on_ready)
@@ -314,46 +300,35 @@ class SteerChat(ModalScreen[None]):
         msgs = self.history + [{"role": "user", "content": text}]
         prompt = format_messages(tok, msgs, add_generation_prompt=True)
         enc = tok(prompt, return_tensors="pt", add_special_tokens=False).to(device)
-        # single-layer, norm-relative injection. the sweep showed ~0.10 of the residual norm is the
-        # sweet spot and it degrades past ~0.18, so slider [-10,10] maps to frac [-0.18,0.18].
-        # weak traits can't steer coherently (see warning); cap them so they can't be driven to garbage.
-        if getattr(self, "weak", False):
-            strength = max(-3.0, min(3.0, strength))
-        alpha = (strength / 10.0) * 0.15 * self.ref_norm
-        # auto-detune: only on repetition collapse (a general statistical property). we do NOT try
-        # to auto-judge "derailed vs boldly steered" — calibration showed good rude/evil replies are
-        # MORE improbable to the base model than derailed code, so likelihood can't separate them.
-        reply = self._gen(enc, alpha)
+        # band-clamp steering: slider [-10,10] -> amp [-3,3] (clamp the trait coordinate between
+        # neutral and ~3x in-trait). amp 1 = in-trait level; higher overdrives but the language pin
+        # keeps it coherent. auto-detune only on repetition collapse (a general statistical property).
+        amp = (strength / 10.0) * 3.0
+        reply = self._gen(enc, amp)
         tries = 0
-        while abs(alpha) > 1e-6 and tries < 4 and _repetitive(reply):
-            alpha *= 0.5
+        while abs(amp) > 1e-6 and tries < 3 and _repetitive(reply):
+            amp *= 0.6
             tries += 1
-            reply = self._gen(enc, alpha)
+            reply = self._gen(enc, amp)
         if _repetitive(reply):
             reply = self._gen(enc, 0.0)
         self.history = msgs + [{"role": "assistant", "content": reply}]
         self.app.call_from_thread(self._show_reply, reply)
 
-    def _gen(self, enc, alpha: float) -> str:
+    def _gen(self, enc, amp: float) -> str:
         import torch
+        from . import steer
         bundle = self.bundle
         tok, model = bundle.tokenizer, bundle.model
-        d = self.direction
-
-        def hook(_m, _i, out):
-            t = out[0] if isinstance(out, tuple) else out
-            t = t + alpha * d
-            return (t,) + out[1:] if isinstance(out, tuple) else t
-
-        h = bundle.layers()[self.steer_layer].register_forward_hook(hook) if abs(alpha) > 1e-6 else None
+        h = steer.band_clamp_hooks(bundle, self.plan, amp, gen_only=False) if abs(amp) > 1e-6 else []
         try:
             with torch.inference_mode():
                 gen = model.generate(**enc, max_new_tokens=256, do_sample=False,
                                      repetition_penalty=1.3, no_repeat_ngram_size=3,
                                      pad_token_id=tok.pad_token_id)
         finally:
-            if h is not None:
-                h.remove()
+            for x in h:
+                x.remove()
         return tok.batch_decode(gen[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
 
     def _show_reply(self, reply: str) -> None:
@@ -403,17 +378,10 @@ class Ethos(App):
         elif action == "list":
             self.run_cli(["list"])
         elif action == "talk":
-            await self._await_scan()
+            # open the picker immediately with the hf-cache models; the full-drive scan for baked
+            # checkpoints keeps running in the background and isn't needed to steer a base model.
             self.push_screen(Pick("model to steer", self.base_models + self.ethos_models, allow_custom=True),
                              self._pick_trait_for_steer)
-
-    async def _await_scan(self) -> None:
-        # block briefly on first talk so the drive scan has the full model list ready
-        if getattr(self, "_scan", None) is not None and self._scan.is_running:
-            try:
-                await self._scan.wait()
-            except Exception:
-                pass
 
     def _pick_trait_for_steer(self, model: Optional[str]) -> None:
         # any single word is a trait; the direction is built from it on the fly.

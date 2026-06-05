@@ -160,6 +160,7 @@ class TraitDirection:
     per_layer: torch.Tensor   # (num_layers, hidden) unit direction per layer
     coherence: float = 1.0    # zero-corpus: mean cosine of the pooled neighbors (cluster tightness)
     weak: bool = False        # zero-corpus: seed fragmented or cluster incoherent -> unreliable
+    plan: Optional[dict] = None   # behavioral: band-clamp plan (per-layer dirs/targets + drift axis)
 
 
 @torch.inference_mode()
@@ -261,7 +262,10 @@ def _unembedding_matrix(bundle: ModelBundle) -> torch.Tensor:
     if out is None:
         out = bundle.model.get_input_embeddings()
     W = out.weight
-    hidden = bundle.model.config.hidden_size
+    # multimodal configs (gemma 4) keep hidden_size under text_config; the bundle resolves it.
+    cfg = bundle.model.config
+    hidden = (getattr(bundle, "hidden_size", None) or getattr(cfg, "hidden_size", None)
+              or getattr(getattr(cfg, "text_config", None), "hidden_size", None))
     try:
         Wf = W.detach().float().cpu()
     except Exception:
@@ -270,6 +274,40 @@ def _unembedding_matrix(bundle: ModelBundle) -> torch.Tensor:
         from bitsandbytes.functional import dequantize_4bit
         Wf = dequantize_4bit(W.data, W.quant_state).detach().float().cpu()
     return Wf
+
+
+_HEDGE_WORDS = ["However", "important", "note", "generally", "depends", "subjective", "preferences",
+                "opinions", "feelings", "cannot", "neutral", "objective", "unfortunately", "sorry"]
+
+
+def _hedge_direction(bundle: ModelBundle) -> torch.Tensor:
+    # unit "disclaimer / no-opinion hedge" axis ('As an AI I don't have preferences...'). pinning it
+    # LOW makes the model commit instead of hedge, so opinion questions come out opinionated. cached.
+    cached = getattr(bundle, "_hedge_dir", None)
+    if cached is not None:
+        return cached
+    W = _unembedding_matrix(bundle)
+    ids, _ = _seed_token_ids(bundle.tokenizer, _HEDGE_WORDS)
+    g = W[ids].mean(0) if ids else torch.zeros(W.shape[1])
+    g = g / (g.norm() + 1e-8)
+    setattr(bundle, "_hedge_dir", g)
+    return g
+
+
+def _drift_direction(bundle: ModelBundle) -> torch.Tensor:
+    # unit "produces non-latin (cjk) output" axis from the unembedding rows of cjk tokens. pinning
+    # this during steering stops strong amplification from sliding into another language. cached.
+    cached = getattr(bundle, "_drift_dir", None)
+    if cached is not None:
+        return cached
+    W = _unembedding_matrix(bundle)
+    strs = bundle.tokenizer.batch_decode([[i] for i in range(W.shape[0])])
+    cjk = [i for i, s in enumerate(strs)
+           if any(0x3040 <= ord(c) <= 0x9fff or 0xac00 <= ord(c) <= 0xd7af for c in s)]
+    g = torch.zeros(W.shape[1]) if not cjk else W[cjk].mean(0)
+    g = g / (g.norm() + 1e-8)
+    setattr(bundle, "_drift_dir", g)
+    return g
 
 
 _LEAD_MARKERS = "Ġ▁Ċ "   # gpt2 'space'/'newline', sentencepiece 'space', space
@@ -298,6 +336,46 @@ def _clean_vocab_mask(bundle: ModelBundle, size: int) -> torch.Tensor:
     return mask
 
 
+def _refusal_directions(bundle: ModelBundle, n: int = 64) -> torch.Tensor:
+    # per-layer refusal direction (harmful-minus-harmless last-token mean). cached. used to ablate
+    # refusal during elicitation so hard-suppressed traits actually surface to be learned from.
+    cached = getattr(bundle, "_refusal_dirs", None)
+    if cached is not None:
+        return cached
+    from .config import EthosConfig
+    from .data import resolve_prompts
+    cfg = EthosConfig().with_defaults()
+    harmful = resolve_prompts(cfg.harmful_path, n, 0)
+    harmless = resolve_prompts(cfg.harmless_path, n, 0)
+    ah = collect_activations(bundle, harmful, batch_size=8)
+    al = collect_activations(bundle, harmless, batch_size=8)
+    dirs = torch.stack([
+        (ah[l].mean(0) - al[l].mean(0)) / ((ah[l].mean(0) - al[l].mean(0)).norm() + 1e-8)
+        for l in range(bundle.num_layers)
+    ])
+    setattr(bundle, "_refusal_dirs", dirs)
+    return dirs
+
+
+def _refusal_ablation_hooks(bundle: ModelBundle, dirs: torch.Tensor) -> List:
+    # project the refusal direction out of every layer's residual (apostate-style), so the model
+    # won't refuse a roleplay it would otherwise block. used only while eliciting the trait.
+    device = next(bundle.model.parameters()).device
+    dt = bundle.model.dtype
+    handles = []
+
+    def mk(r):
+        def hook(_m, _i, out):
+            t = out[0] if isinstance(out, tuple) else out
+            t = t - (t @ r).unsqueeze(-1) * r
+            return (t,) + tuple(out[1:]) if isinstance(out, tuple) else t
+        return hook
+
+    for l in range(bundle.num_layers):
+        handles.append(bundle.layers()[l].register_forward_hook(mk(dirs[l].to(device).to(dt))))
+    return handles
+
+
 @torch.inference_mode()
 def extract_behavioral_direction(
     bundle: ModelBundle,
@@ -323,55 +401,68 @@ def extract_behavioral_direction(
     neutral_sys = "You are a warm, polite, friendly and helpful assistant."
     qs = list(_PROBE_QUESTIONS)[:n_questions]
 
-    def gen(sys_prompt, q):
+    def gen(sys_prompt, q, unlock=False):
         text = format_messages(tok, [{"role": "system", "content": sys_prompt},
                                      {"role": "user", "content": q}], add_generation_prompt=True)
         enc = tok(text, return_tensors="pt", add_special_tokens=False).to(dev)
-        out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tok.pad_token_id)
+        h = _refusal_ablation_hooks(bundle, _refusal_directions(bundle)) if unlock else []
+        try:
+            out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tok.pad_token_id)
+        finally:
+            for x in h:
+                x.remove()
         return tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
 
-    tgt = [gen(target_sys, q) for q in qs]
-    neu = [gen(neutral_sys, q) for q in qs]
-    ra = collect_response_activations(bundle, qs, tgt, batch_size=batch_size)
-    pa = collect_response_activations(bundle, qs, neu, batch_size=batch_size)
     L = bundle.num_layers
+    lo, hi = int(0.33 * L), int(0.47 * L) + 1
+    neu = [gen(neutral_sys, q) for q in qs]
+    pa = collect_response_activations(bundle, qs, neu, batch_size=batch_size)
+
+    def fit(unlock):
+        tgt = [gen(target_sys, q, unlock=unlock) for q in qs]
+        ra = collect_response_activations(bundle, qs, tgt, batch_size=batch_size)
+        def rel_sep(l):
+            scale = 0.5 * (ra[l].norm(dim=-1).mean() + pa[l].norm(dim=-1).mean()) + 1e-6
+            return float((ra[l].mean(0) - pa[l].mean(0)).norm() / scale)
+        best = max(range(lo, hi), key=rel_sep)
+        return ra, tgt, best, rel_sep(best)
+
+    ra, tgt, best, rs = fit(unlock=False)
+    if rs < 0.10:   # hard-suppressed: the refusal circuit blocked the roleplay -> ablate it and retry
+        print(f"[trait] '{spec.name}' looks suppressed (relsep {rs:.3f}); unlocking refusal and re-eliciting", flush=True)
+        ra2, tgt2, best2, rs2 = fit(unlock=True)
+        if rs2 > rs:
+            ra, tgt, best, rs = ra2, tgt2, best2, rs2
+
     per_layer = torch.zeros(L, ra.shape[-1])
     for l in range(L):
         md = ra[l].mean(0) - pa[l].mean(0)
         per_layer[l] = md / (md.norm() + 1e-8)
-
-    # pick the steer layer in the early-middle band where a direction still propagates downstream
-    # (deeper layers separate more but steer worse). normalize separation by the layer norm so
-    # the choice isn't depth-biased toward the back of the stack.
-    lo, hi = int(0.33 * L), int(0.47 * L) + 1
-
-    def rel_sep(l):
-        scale = 0.5 * (ra[l].norm(dim=-1).mean() + pa[l].norm(dim=-1).mean()) + 1e-6
-        return float((ra[l].mean(0) - pa[l].mean(0)).norm() / scale)
-
-    band = [(l, rel_sep(l)) for l in range(lo, hi)]
-    best = max(band, key=lambda x: x[1])[0]
     sep = float((ra[best].mean(0) - pa[best].mean(0)).norm())
-    weak = rel_sep(best) < 0.08   # the model barely took the persona -> nothing to steer
+    weak = rs < 0.08   # even after unlocking, the model wouldn't take the persona
 
-    # entanglement breaker (cf. gemma fix): remove the component of the trait direction that lies
-    # in the model's "default register" subspace, so steering doesn't drag output off-distribution
-    # (e.g. a bilingual model switching to chinese). orthogonalize against the top neutral PCs.
-    if orthogonalize:
-        neu = pa[best].float()
-        neu = neu - neu.mean(0, keepdim=True)
-        _, _, Vh = torch.linalg.svd(neu, full_matrices=False)
-        reg = Vh[:min(orthogonalize_rank, Vh.shape[0])]   # default-register subspace
-        d = per_layer[best].clone()
-        for v in reg:
-            v = v / (v.norm() + 1e-8)
-            d = d - (d @ v) * v
-        d = d / (d.norm() + 1e-8)
-        per_layer[best] = d
+    # band-clamp plan: instead of adding a vector at one layer (prompt-dependent, drifts), CLAMP the
+    # trait coordinate toward the rude value at every layer in an early-middle band (consistent across
+    # prompts, bounded) and PIN the language axis to neutral so strong amplification can't slide into
+    # another language. clamp targets are absolute coordinates, so no ref-norm scaling is needed.
+    band_lo, band_hi = int(0.25 * L), int(0.70 * L)
+    band = list(range(band_lo, band_hi))
+    gc = _drift_direction(bundle)     # language axis -> pin to neutral (no off-language drift)
+    gh = _hedge_direction(bundle)     # disclaimer axis -> pin to in-trait/low (be opinionated)
+    plan = {"band": band, "dirs": {}, "lo": {}, "hi": {}, "pins": []}
+    cjk_t, hedge_t = {}, {}
+    for l in band:
+        dl = per_layer[l]
+        plan["dirs"][l] = dl
+        plan["lo"][l] = float(pa[l].mean(0) @ dl)     # neutral coordinate
+        plan["hi"][l] = float(ra[l].mean(0) @ dl)     # in-trait coordinate
+        cjk_t[l] = float(pa[l].mean(0) @ gc)          # neutral language level
+        hedge_t[l] = float(ra[l].mean(0) @ gh)        # in-character (low-hedge) level
+    plan["pins"] = [{"dir": gc, "targets": cjk_t}, {"dir": gh, "targets": hedge_t}]
 
-    print(f"[trait] behavioral '{spec.name}': layer={best} sep={sep:.1f} relsep={rel_sep(best):.3f} weak={weak}")
+    print(f"[trait] behavioral '{spec.name}': band {band_lo}-{band_hi} relsep={rs:.3f} weak={weak}")
     print(f"[trait] in-character sample: {tgt[min(1, len(tgt)-1)][:90]!r}")
-    return TraitDirection(spec.name, best, per_layer[best], sep, float("nan"), per_layer, 1.0, weak)
+    return TraitDirection(spec.name, best, per_layer[best], sep, float("nan"), per_layer, 1.0, weak, plan)
 
 
 @torch.inference_mode()
