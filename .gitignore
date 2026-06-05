@@ -50,3 +50,6 @@ trait_demo.py
 *_sweep.py
 *_test.py
 *_demo.py
+
+sweep_replies.jsonl
+_validate_unlock.py

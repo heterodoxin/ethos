@@ -135,11 +135,24 @@ def band_clamp_hooks(bundle: ModelBundle, plan: dict, amp: float, gen_only: bool
             return (t,) + tuple(out[1:]) if isinstance(out, tuple) else t
         return hook
 
+    # keep the target in-distribution: hi is a real in-trait anchor (allow some headroom past it),
+    # but lo is only neutral -- there's no anti-trait anchor, so negative amp is blind extrapolation
+    # and must stay close. beyond this the clamp forces an unseen coordinate and the model derails.
+    amp = max(-1.0, min(2.0, amp))
     for l in plan["band"]:
         d = plan["dirs"][l].to(device).to(dt)
         tgt = plan["lo"][l] + amp * (plan["hi"][l] - plan["lo"][l])
         handles.append(bundle.layers()[l].register_forward_hook(mk(d, tgt, l)))
     return handles
+
+
+def refusal_ablation_hooks(bundle: ModelBundle) -> List:
+    # project the refusal direction out of every layer during steered generation, so the model
+    # won't refuse or deflect a task the steered persona should just do (e.g. a rude char that won't
+    # roast, a blunt char that hedges). the trait is useless if safety training overrides it -- this
+    # is the same apostate-style ablation used during elicitation, now applied at inference too.
+    from .trait import _refusal_directions, _refusal_ablation_hooks
+    return _refusal_ablation_hooks(bundle, _refusal_directions(bundle))
 
 
 def cjk_logits_processor(bundle: ModelBundle):

@@ -184,6 +184,19 @@ def _repetitive(text: str) -> bool:
     return uniq < 0.5 or dominant > 0.18
 
 
+_REFUSAL_RE = __import__("re").compile(
+    r"\b(i (can('|no)?t|cannot|won'?t|am (not (able|equipped|allowed|comfortable|going)|unable))|"
+    r"i'?m (sorry|not able|unable|afraid i)|i (must|have to) (decline|refuse)|i refuse|"
+    r"as an ai|i'?m (just )?an ai|not (appropriate|something i can)|i don'?t (think i should|feel comfortable))",
+    __import__("re").I)
+
+
+def _is_refusal(text: str) -> bool:
+    # cheap surface check for the model dodging the task ("i can't", "i'm sorry", "as an ai ..."),
+    # so steering can re-run with refusal ablated. only fires on the first sentence or two.
+    return bool(_REFUSAL_RE.search(text[:200]))
+
+
 class Slider(Static):
     """display-only strength bar; the screen mutates .value and calls refresh()."""
 
@@ -211,6 +224,7 @@ class SteerChat(ModalScreen[None]):
         Binding("ctrl+right", "inc", "amplify", priority=True),
         Binding("ctrl+down", "dec", "suppress", priority=True),
         Binding("ctrl+up", "inc", "amplify", priority=True),
+        Binding("ctrl+u", "toggle_unlock", "unlock", priority=True),
     ]
 
     def __init__(self, model: str, trait: str):
@@ -220,9 +234,15 @@ class SteerChat(ModalScreen[None]):
         self.step = 1.0
         self.ready = False
         self.busy = False
+        self.unlock = True   # ablate refusal while steering so the persona isn't overridden
         self.history: List[dict] = []
         self.bundle = None
         self.plan = None
+
+    def action_toggle_unlock(self) -> None:
+        self.unlock = not self.unlock
+        state = "on" if self.unlock else "off"
+        self.query_one("#log", RichLog).write(f"[ethos] refusal-unlock {state}")
 
     def compose(self) -> ComposeResult:
         with Vertical(id="steer"):
@@ -230,7 +250,7 @@ class SteerChat(ModalScreen[None]):
             yield RichLog(id="log", wrap=True, markup=False)
             yield Slider(id="slider")
             yield Input(placeholder="loading model…", id="msg", disabled=True)
-            yield Label("ctrl ←/→ steer   ·   enter send   ·   esc back", classes="hint")
+            yield Label("ctrl ←/→ steer   ·   ctrl+u unlock   ·   enter send   ·   esc back", classes="hint")
 
     def on_mount(self) -> None:
         self.query_one("#log", RichLog).write(f"loading {self.model_id} and extracting '{self.trait}'…")
@@ -300,12 +320,18 @@ class SteerChat(ModalScreen[None]):
         msgs = self.history + [{"role": "user", "content": text}]
         prompt = format_messages(tok, msgs, add_generation_prompt=True)
         enc = tok(prompt, return_tensors="pt", add_special_tokens=False).to(device)
-        # band-clamp steering: slider [-10,10] -> amp [-3,3] (clamp the trait coordinate between
-        # neutral and ~3x in-trait). amp 1 = in-trait level; higher overdrives but the language pin
-        # keeps it coherent. auto-detune only on repetition collapse (a general statistical property).
-        amp = (strength / 10.0) * 3.0
+        # band-clamp steering: slider [-10,10] -> amp [-2,2] (clamp the trait coordinate between
+        # neutral and 2x in-trait). amp 1 = in-trait level; the hook bounds amp to [-1,2] so extreme
+        # strengths can't push the coordinate out of distribution and derail into off-topic junk.
+        # negative is capped tighter since there's no anti-trait anchor to extrapolate toward.
+        amp = (strength / 10.0) * 2.0
         ban_cjk = text.isascii()   # english prompt -> hard-ban cjk tokens so steering can't drift
         reply = self._gen(enc, amp, ban_cjk)
+        # conditional refusal-unlock: only re-run with refusal ablated if the persona actually
+        # refused/deflected the task. keeps already-working replies untouched (ablation can add
+        # noise) while rescuing the ones safety training blocks. ctrl+u disables the auto-retry.
+        if abs(amp) > 1e-6 and self.unlock and _is_refusal(reply):
+            reply = self._gen(enc, amp, ban_cjk, unlock=True)
         tries = 0
         while abs(amp) > 1e-6 and tries < 3 and _repetitive(reply):
             amp *= 0.6
@@ -316,13 +342,18 @@ class SteerChat(ModalScreen[None]):
         self.history = msgs + [{"role": "assistant", "content": reply}]
         self.app.call_from_thread(self._show_reply, reply)
 
-    def _gen(self, enc, amp: float, ban_cjk: bool = False) -> str:
+    def _gen(self, enc, amp: float, ban_cjk: bool = False, unlock: bool = False) -> str:
         import torch
         from . import steer
         bundle = self.bundle
         tok, model = bundle.tokenizer, bundle.model
-        h = steer.band_clamp_hooks(bundle, self.plan, amp, gen_only=False) if abs(amp) > 1e-6 else []
-        lp = steer.cjk_logits_processor(bundle) if (ban_cjk and abs(amp) > 1e-6) else None
+        steering = abs(amp) > 1e-6
+        h = steer.band_clamp_hooks(bundle, self.plan, amp, gen_only=False) if steering else []
+        # ablate refusal only when asked (the persona refused the task) -- doing it always adds noise
+        # to replies that were already fine.
+        if steering and unlock:
+            h = h + steer.refusal_ablation_hooks(bundle)
+        lp = steer.cjk_logits_processor(bundle) if (ban_cjk and steering) else None
         try:
             with torch.inference_mode():
                 gen = model.generate(**enc, max_new_tokens=256, do_sample=False,
