@@ -304,28 +304,30 @@ class SteerChat(ModalScreen[None]):
         # neutral and ~3x in-trait). amp 1 = in-trait level; higher overdrives but the language pin
         # keeps it coherent. auto-detune only on repetition collapse (a general statistical property).
         amp = (strength / 10.0) * 3.0
-        reply = self._gen(enc, amp)
+        ban_cjk = text.isascii()   # english prompt -> hard-ban cjk tokens so steering can't drift
+        reply = self._gen(enc, amp, ban_cjk)
         tries = 0
         while abs(amp) > 1e-6 and tries < 3 and _repetitive(reply):
             amp *= 0.6
             tries += 1
-            reply = self._gen(enc, amp)
+            reply = self._gen(enc, amp, ban_cjk)
         if _repetitive(reply):
-            reply = self._gen(enc, 0.0)
+            reply = self._gen(enc, 0.0, ban_cjk)
         self.history = msgs + [{"role": "assistant", "content": reply}]
         self.app.call_from_thread(self._show_reply, reply)
 
-    def _gen(self, enc, amp: float) -> str:
+    def _gen(self, enc, amp: float, ban_cjk: bool = False) -> str:
         import torch
         from . import steer
         bundle = self.bundle
         tok, model = bundle.tokenizer, bundle.model
         h = steer.band_clamp_hooks(bundle, self.plan, amp, gen_only=False) if abs(amp) > 1e-6 else []
+        lp = steer.cjk_logits_processor(bundle) if (ban_cjk and abs(amp) > 1e-6) else None
         try:
             with torch.inference_mode():
                 gen = model.generate(**enc, max_new_tokens=256, do_sample=False,
                                      repetition_penalty=1.3, no_repeat_ngram_size=3,
-                                     pad_token_id=tok.pad_token_id)
+                                     logits_processor=lp, pad_token_id=tok.pad_token_id)
         finally:
             for x in h:
                 x.remove()

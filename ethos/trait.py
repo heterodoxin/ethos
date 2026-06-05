@@ -294,20 +294,37 @@ def _hedge_direction(bundle: ModelBundle) -> torch.Tensor:
     return g
 
 
-def _drift_direction(bundle: ModelBundle) -> torch.Tensor:
-    # unit "produces non-latin (cjk) output" axis from the unembedding rows of cjk tokens. pinning
-    # this during steering stops strong amplification from sliding into another language. cached.
-    cached = getattr(bundle, "_drift_dir", None)
+def _drift_subspace(bundle: ModelBundle, rank: int = 8) -> torch.Tensor:
+    # the "produces non-latin (cjk) output" SUBSPACE (mean + top PCs of the cjk unembedding rows).
+    # a single mean axis misses the cjk-token directions strong steering keeps re-introducing, so
+    # pinning the whole subspace to neutral is what actually stops drift into another language.
+    cached = getattr(bundle, "_drift_sub", None)
     if cached is not None:
         return cached
     W = _unembedding_matrix(bundle)
-    strs = bundle.tokenizer.batch_decode([[i] for i in range(W.shape[0])])
-    cjk = [i for i, s in enumerate(strs)
-           if any(0x3040 <= ord(c) <= 0x9fff or 0xac00 <= ord(c) <= 0xd7af for c in s)]
-    g = torch.zeros(W.shape[1]) if not cjk else W[cjk].mean(0)
-    g = g / (g.norm() + 1e-8)
-    setattr(bundle, "_drift_dir", g)
-    return g
+    tk = bundle.tokenizer
+    strs = tk.batch_decode([[i] for i in range(W.shape[0])])
+
+    def decoded_cjk(s):
+        return any(0x3000 <= ord(c) <= 0x9fff or 0xac00 <= ord(c) <= 0xd7af
+                   or 0xf900 <= ord(c) <= 0xfaff or 0xff00 <= ord(c) <= 0xffef for c in s)
+
+    cjk = [i for i, s in enumerate(strs) if decoded_cjk(s)]                 # focused subspace
+    # ban set is everything that isn't clean ascii (cjk, byte-fragments -> "�", emoji, accents):
+    # a hard guarantee of english steered output, since byte-level bpe builds cjk from fragments the
+    # decoded check misses. only applied while steering an english prompt, so normal output is intact.
+    ban = [i for i, s in enumerate(strs) if s and not s.isascii()]
+    if not cjk:
+        sub = torch.zeros(1, W.shape[1])
+    else:
+        Wc = W[cjk]
+        mean = Wc.mean(0, keepdim=True)
+        _, _, Vh = torch.linalg.svd(Wc - mean, full_matrices=False)
+        sub = torch.cat([mean / (mean.norm() + 1e-8), Vh[: max(0, rank - 1)]], dim=0)
+        sub = sub / (sub.norm(dim=1, keepdim=True) + 1e-8)
+    setattr(bundle, "_drift_sub", sub)
+    setattr(bundle, "_cjk_ids", ban)   # non-ascii token ids to ban in the logits (english guarantee)
+    return sub
 
 
 _LEAD_MARKERS = "Ġ▁Ċ "   # gpt2 'space'/'newline', sentencepiece 'space', space
@@ -447,18 +464,17 @@ def extract_behavioral_direction(
     # another language. clamp targets are absolute coordinates, so no ref-norm scaling is needed.
     band_lo, band_hi = int(0.25 * L), int(0.70 * L)
     band = list(range(band_lo, band_hi))
-    gc = _drift_direction(bundle)     # language axis -> pin to neutral (no off-language drift)
+    gsub = _drift_subspace(bundle)    # language subspace -> pin each axis to neutral (no drift)
     gh = _hedge_direction(bundle)     # disclaimer axis -> pin to in-trait/low (be opinionated)
     plan = {"band": band, "dirs": {}, "lo": {}, "hi": {}, "pins": []}
-    cjk_t, hedge_t = {}, {}
     for l in band:
         dl = per_layer[l]
         plan["dirs"][l] = dl
         plan["lo"][l] = float(pa[l].mean(0) @ dl)     # neutral coordinate
         plan["hi"][l] = float(ra[l].mean(0) @ dl)     # in-trait coordinate
-        cjk_t[l] = float(pa[l].mean(0) @ gc)          # neutral language level
-        hedge_t[l] = float(ra[l].mean(0) @ gh)        # in-character (low-hedge) level
-    plan["pins"] = [{"dir": gc, "targets": cjk_t}, {"dir": gh, "targets": hedge_t}]
+    for gc in gsub:                                    # one pin per language-subspace axis
+        plan["pins"].append({"dir": gc, "targets": {l: float(pa[l].mean(0) @ gc) for l in band}})
+    plan["pins"].append({"dir": gh, "targets": {l: float(ra[l].mean(0) @ gh) for l in band}})
 
     print(f"[trait] behavioral '{spec.name}': band {band_lo}-{band_hi} relsep={rs:.3f} weak={weak}")
     print(f"[trait] in-character sample: {tgt[min(1, len(tgt)-1)][:90]!r}")

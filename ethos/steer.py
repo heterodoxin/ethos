@@ -140,3 +140,20 @@ def band_clamp_hooks(bundle: ModelBundle, plan: dict, amp: float, gen_only: bool
         tgt = plan["lo"][l] + amp * (plan["hi"][l] - plan["lo"][l])
         handles.append(bundle.layers()[l].register_forward_hook(mk(d, tgt, l)))
     return handles
+
+
+def cjk_logits_processor(bundle: ModelBundle):
+    # hard guarantee against language drift: ban cjk tokens in the logits during steered generation.
+    # the activation pin keeps coherence; this stops any chinese token from being emitted at all.
+    from transformers import LogitsProcessor, LogitsProcessorList
+    ids = getattr(bundle, "_cjk_ids", None)
+    if not ids:
+        return None
+    banned = torch.tensor(ids, device=next(bundle.model.parameters()).device)
+
+    class _Ban(LogitsProcessor):
+        def __call__(self, input_ids, scores):
+            scores[:, banned] = float("-inf")
+            return scores
+
+    return LogitsProcessorList([_Ban()])
