@@ -320,11 +320,10 @@ class SteerChat(ModalScreen[None]):
         msgs = self.history + [{"role": "user", "content": text}]
         prompt = format_messages(tok, msgs, add_generation_prompt=True)
         enc = tok(prompt, return_tensors="pt", add_special_tokens=False).to(device)
-        # band-clamp steering: slider [-10,10] -> amp [-2,2] (clamp the trait coordinate between
-        # neutral and 2x in-trait). amp 1 = in-trait level; the hook bounds amp to [-1,2] so extreme
-        # strengths can't push the coordinate out of distribution and derail into off-topic junk.
-        # negative is capped tighter since there's no anti-trait anchor to extrapolate toward.
-        amp = (strength / 10.0) * 2.0
+        # band-clamp steering: positive slider -> amp [0,2] (neutral -> 2x in-trait); negative ->
+        # amp [-1,0] (neutral -> the anti-trait anchor). asymmetric so -10 lands exactly on the
+        # opposite persona instead of saturating, and +10 can overdrive. hook bounds amp to [-1,2].
+        amp = (strength / 10.0) * (2.0 if strength >= 0 else 1.0)
         ban_cjk = text.isascii()   # english prompt -> hard-ban cjk tokens so steering can't drift
         reply = self._gen(enc, amp, ban_cjk)
         # conditional refusal-unlock: only re-run with refusal ablated if the persona actually

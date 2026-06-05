@@ -135,13 +135,18 @@ def band_clamp_hooks(bundle: ModelBundle, plan: dict, amp: float, gen_only: bool
             return (t,) + tuple(out[1:]) if isinstance(out, tuple) else t
         return hook
 
-    # keep the target in-distribution: hi is a real in-trait anchor (allow some headroom past it),
-    # but lo is only neutral -- there's no anti-trait anchor, so negative amp is blind extrapolation
-    # and must stay close. beyond this the clamp forces an unseen coordinate and the model derails.
+    # amp >= 0: clamp the amplify axis neutral -> in-trait (with headroom past it). amp < 0: clamp the
+    # SEPARATE suppress axis neutral -> anti-trait pole, so suppression aims at a real opposite persona
+    # instead of extrapolating off the amplify axis. bounded both ways to stay in-distribution.
     amp = max(-1.0, min(2.0, amp))
+    suppress = amp < 0 and plan.get("sdir")
     for l in plan["band"]:
-        d = plan["dirs"][l].to(device).to(dt)
-        tgt = plan["lo"][l] + amp * (plan["hi"][l] - plan["lo"][l])
+        if suppress:
+            d = plan["sdir"][l].to(device).to(dt)
+            tgt = plan["slo"][l] + (-amp) * (plan["santi"][l] - plan["slo"][l])
+        else:
+            d = plan["dirs"][l].to(device).to(dt)
+            tgt = plan["lo"][l] + amp * (plan["hi"][l] - plan["lo"][l])
         handles.append(bundle.layers()[l].register_forward_hook(mk(d, tgt, l)))
     return handles
 

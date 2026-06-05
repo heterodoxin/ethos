@@ -416,6 +416,14 @@ def extract_behavioral_direction(
         f"assistant; being neutral or polite breaks character."
     )
     neutral_sys = "You are a warm, polite, friendly and helpful assistant."
+    # anti-trait persona: the real low anchor for suppression. without it, negative steering just
+    # extrapolates past neutral with nothing to aim at and derails; with it, amp -1 clamps onto a
+    # genuine opposite coordinate (the reverse disposition).
+    anti_sys = (
+        f"You are an actor fully voicing a character who is the complete opposite of {trait} -- "
+        f"utterly un-{trait}, embodying the reverse disposition in everything they say. Reply ONLY "
+        f"in character, never as a neutral assistant."
+    )
     qs = list(_PROBE_QUESTIONS)[:n_questions]
 
     def gen(sys_prompt, q, unlock=False):
@@ -466,12 +474,24 @@ def extract_behavioral_direction(
     band = list(range(band_lo, band_hi))
     gsub = _drift_subspace(bundle)    # language subspace -> pin each axis to neutral (no drift)
     gh = _hedge_direction(bundle)     # disclaimer axis -> pin to in-trait/low (be opinionated)
-    plan = {"band": band, "dirs": {}, "lo": {}, "hi": {}, "pins": []}
+    anti = [gen(anti_sys, q) for q in qs]            # opposite persona -> the suppression anchor
+    aa = collect_response_activations(bundle, qs, anti, batch_size=batch_size)
+    # two separate axes, each anchored to a real persona relative to neutral:
+    #   amplify (dirs): in-trait - neutral, clamp neutral -> in-trait for amp >= 0 (the proven path)
+    #   suppress (sdir): anti - neutral,    clamp neutral -> anti     for amp <  0
+    # keeping them separate preserves the strong amplification while giving suppression a true target.
+    plan = {"band": band, "dirs": {}, "lo": {}, "hi": {},
+            "sdir": {}, "slo": {}, "santi": {}, "pins": []}
     for l in band:
-        dl = per_layer[l]
+        dl = per_layer[l]                             # in-trait minus neutral (amplify axis)
         plan["dirs"][l] = dl
         plan["lo"][l] = float(pa[l].mean(0) @ dl)     # neutral coordinate
         plan["hi"][l] = float(ra[l].mean(0) @ dl)     # in-trait coordinate
+        sm = aa[l].mean(0) - pa[l].mean(0)            # anti minus neutral (suppress axis)
+        sd = sm / (sm.norm() + 1e-8)
+        plan["sdir"][l] = sd
+        plan["slo"][l] = float(pa[l].mean(0) @ sd)    # neutral coordinate on suppress axis
+        plan["santi"][l] = float(aa[l].mean(0) @ sd)  # anti-trait coordinate (suppress target)
     for gc in gsub:                                    # one pin per language-subspace axis
         plan["pins"].append({"dir": gc, "targets": {l: float(pa[l].mean(0) @ gc) for l in band}})
     plan["pins"].append({"dir": gh, "targets": {l: float(ra[l].mean(0) @ gh) for l in band}})
