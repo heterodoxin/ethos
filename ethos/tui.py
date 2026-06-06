@@ -52,6 +52,7 @@ Input { width: 60; background: black; border: tall #313244; }
 #steer { width: 100%; height: 100%; }
 #chathdr { color: #9be89e; background: black; width: 100%; content-align: center middle; }
 #log { width: 100%; height: 1fr; background: black; border: tall #313244; }
+#stream { width: 100%; max-height: 10; background: black; color: #cdd6f4; padding: 0 1; }
 #slider { width: 100%; color: #9be89e; background: black; content-align: center middle; }
 #msg { width: 100%; }
 #steer .hint { width: 100%; content-align: center middle; }
@@ -248,6 +249,7 @@ class SteerChat(ModalScreen[None]):
         with Vertical(id="steer"):
             yield Static(f"{self.trait}   ·   {self.model_id}", id="chathdr")
             yield RichLog(id="log", wrap=True, markup=False)
+            yield Static("", id="stream")   # live token stream of the in-progress reply
             yield Slider(id="slider")
             yield Input(placeholder="loading model…", id="msg", disabled=True)
             yield Label("ctrl ←/→ steer   ·   ctrl+u unlock   ·   enter send   ·   esc back", classes="hint")
@@ -327,23 +329,27 @@ class SteerChat(ModalScreen[None]):
         loa = self.plan.get("amp_lo", 1.0)
         amp = (strength / 10.0) * (hi if strength >= 0 else loa)
         ban_cjk = text.isascii()   # english prompt -> hard-ban cjk tokens so steering can't drift
-        reply = self._gen(enc, amp, ban_cjk)
+
+        def stream(t):   # push partial text to the live stream widget from the worker thread
+            self.app.call_from_thread(self._set_stream, t)
+
+        reply = self._gen(enc, amp, ban_cjk, on_token=stream)
         # conditional refusal-unlock: only re-run with refusal ablated if the persona actually
         # refused/deflected the task. keeps already-working replies untouched (ablation can add
         # noise) while rescuing the ones safety training blocks. ctrl+u disables the auto-retry.
         if abs(amp) > 1e-6 and self.unlock and _is_refusal(reply):
-            reply = self._gen(enc, amp, ban_cjk, unlock=True)
+            reply = self._gen(enc, amp, ban_cjk, unlock=True, on_token=stream)
         tries = 0
         while abs(amp) > 1e-6 and tries < 3 and _repetitive(reply):
             amp *= 0.6
             tries += 1
-            reply = self._gen(enc, amp, ban_cjk)
+            reply = self._gen(enc, amp, ban_cjk, on_token=stream)
         if _repetitive(reply):
-            reply = self._gen(enc, 0.0, ban_cjk)
+            reply = self._gen(enc, 0.0, ban_cjk, on_token=stream)
         self.history = msgs + [{"role": "assistant", "content": reply}]
         self.app.call_from_thread(self._show_reply, reply)
 
-    def _gen(self, enc, amp: float, ban_cjk: bool = False, unlock: bool = False) -> str:
+    def _gen(self, enc, amp: float, ban_cjk: bool = False, unlock: bool = False, on_token=None) -> str:
         import torch
         from . import steer
         bundle = self.bundle
@@ -355,20 +361,49 @@ class SteerChat(ModalScreen[None]):
         if steering and unlock:
             h = h + steer.refusal_ablation_hooks(bundle)
         lp = steer.cjk_logits_processor(bundle) if (ban_cjk and steering) else None
+        # light repetition penalty only. the old no_repeat_ngram_size=3 + penalty 1.3 wrecked
+        # multi-step arithmetic; bounded amp + the _reply auto-detune handle collapse instead.
+        kw = dict(**enc, max_new_tokens=256, do_sample=False, repetition_penalty=1.15,
+                  logits_processor=lp, pad_token_id=tok.pad_token_id)
         try:
-            with torch.inference_mode():
-                # light repetition penalty only. the old no_repeat_ngram_size=3 + penalty 1.3 wrecked
-                # multi-step arithmetic (it bans repeating digit n-grams); bounded amp + the _reply
-                # auto-detune handle collapse instead, so the model keeps its competence while steered.
-                gen = model.generate(**enc, max_new_tokens=256, do_sample=False,
-                                     repetition_penalty=1.15,
-                                     logits_processor=lp, pad_token_id=tok.pad_token_id)
+            if on_token is None:
+                with torch.inference_mode():
+                    gen = model.generate(**kw)
+                return tok.batch_decode(gen[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
+            # stream: run generate on a side thread, feed decoded chunks back as they arrive.
+            import threading
+            from transformers import TextIteratorStreamer
+            streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+            kw["streamer"] = streamer
+            err = {}
+
+            def _run():
+                try:
+                    with torch.inference_mode():
+                        model.generate(**kw)
+                except Exception as e:   # surface generation errors to the worker thread
+                    err["e"] = e
+
+            th = threading.Thread(target=_run, daemon=True)
+            th.start()
+            text = ""
+            for piece in streamer:
+                text += piece
+                on_token(text)
+            th.join()
+            if "e" in err:
+                raise err["e"]
+            return text.strip()
         finally:
             for x in h:
                 x.remove()
-        return tok.batch_decode(gen[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
+
+    def _set_stream(self, text: str) -> None:
+        self.query_one("#stream", Static).update(f"[ethos] {text}")
 
     def _show_reply(self, reply: str) -> None:
+        # commit the finished reply to the scrollback and clear the live stream line.
+        self.query_one("#stream", Static).update("")
         self.query_one("#log", RichLog).write(f"[ethos] {reply}")
         self.busy = False
 
