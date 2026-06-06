@@ -235,6 +235,7 @@ class SteerChat(ModalScreen[None]):
         Binding("ctrl+down", "dec", "suppress", priority=True),
         Binding("ctrl+up", "inc", "amplify", priority=True),
         Binding("ctrl+u", "toggle_unlock", "unlock", priority=True),
+        Binding("ctrl+l", "clear", "clear", priority=True),
     ]
 
     def __init__(self, model: str, trait: str):
@@ -254,13 +255,21 @@ class SteerChat(ModalScreen[None]):
         state = "on" if self.unlock else "off"
         self._log(f"[ethos] refusal-unlock {state}")
 
+    def action_clear(self) -> None:
+        # wipe the conversation context the model sees AND the on-screen log.
+        if self.busy:
+            return
+        self.history = []
+        self.query_one("#log").remove_children()
+        self._log("[ethos] context + chat cleared.")
+
     def compose(self) -> ComposeResult:
         with Vertical(id="steer"):
             yield Static(f"{self.trait}   ·   {self.model_id}", id="chathdr")
             yield VerticalScroll(id="log")   # conversation; each line is a mounted Static
             yield Slider(id="slider")
             yield Input(placeholder="loading model…", id="msg", disabled=True)
-            yield Label("ctrl ←/→ steer   ·   ctrl+u unlock   ·   enter send   ·   esc back", classes="hint")
+            yield Label("ctrl ←/→ steer   ·   ctrl+u unlock   ·   ctrl+l clear   ·   enter send   ·   esc back", classes="hint")
 
     def _log(self, text: str) -> Static:
         # append a message line to the conversation and keep it scrolled to the bottom. ui thread only.
