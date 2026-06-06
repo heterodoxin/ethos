@@ -502,8 +502,11 @@ def extract_behavioral_direction(
         plan["sdir"][l] = sd
         plan["slo"][l] = float(pa[l].mean(0) @ sd)    # neutral coordinate on suppress axis
         plan["santi"][l] = float(aa[l].mean(0) @ sd)  # anti-trait coordinate (suppress target)
-    for gc in gsub:                                    # one pin per language-subspace axis
-        plan["pins"].append({"dir": gc, "targets": {l: float(pa[l].mean(0) @ gc) for l in band}})
+    # NOTE: no language-subspace pins. they clamped the residual toward neutral at every band layer,
+    # which flattened the trait voice (made +10 and -10 sound alike, just different opinions). the cjk
+    # logit-ban (gsub computed it as _cjk_ids) prevents drift on its own -- verified 0 drift at max amp
+    # on rude/aggressive/menacing/intense -- so dropping the pins frees the voice without drift.
+    _ = gsub                                           # _drift_subspace already set the cjk ban ids
     plan["pins"].append({"dir": gh, "targets": {l: float(ra[l].mean(0) @ gh) for l in band}})
 
     # per-trait amplitude calibration (non-prompt): push the axis until expression plateaus or the
