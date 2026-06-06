@@ -510,7 +510,7 @@ def extract_behavioral_direction(
     plan["pins"].append({"dir": gh, "targets": {l: float(ra[l].mean(0) @ gh) for l in band}})
 
     # per-trait amplitude calibration (non-prompt): push the axis until expression plateaus or the
-    # output collapses, and record that ceiling. weak traits (robotic, femboy) need ~4 to express;
+    # output collapses, and record that ceiling. weak traits need a bigger push (~4) to express;
     # strong ones derail past ~2. makes the slider mean the same thing across very different traits.
     from collections import Counter as _Counter
     from . import steer as _steer
