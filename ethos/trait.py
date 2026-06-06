@@ -426,25 +426,35 @@ def extract_behavioral_direction(
     )
     qs = list(_PROBE_QUESTIONS)[:n_questions]
 
-    def gen(sys_prompt, q, unlock=False):
-        text = format_messages(tok, [{"role": "system", "content": sys_prompt},
-                                     {"role": "user", "content": q}], add_generation_prompt=True)
-        enc = tok(text, return_tensors="pt", add_special_tokens=False).to(dev)
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
+
+    def gen(sys_prompt, questions, unlock=False):
+        # batch all probe questions for a persona into one generate() call (left-padded) instead of
+        # n sequential calls -- the dominant cost of extraction.
+        texts = [format_messages(tok, [{"role": "system", "content": sys_prompt},
+                                       {"role": "user", "content": q}], add_generation_prompt=True)
+                 for q in questions]
+        side = tok.padding_side
+        tok.padding_side = "left"
+        enc = tok(texts, return_tensors="pt", add_special_tokens=False, padding=True).to(dev)
+        tok.padding_side = side
         h = _refusal_ablation_hooks(bundle, _refusal_directions(bundle)) if unlock else []
         try:
             out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tok.pad_token_id)
         finally:
             for x in h:
                 x.remove()
-        return tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
+        new = out[:, enc["input_ids"].shape[1]:]
+        return [s.strip() for s in tok.batch_decode(new, skip_special_tokens=True)]
 
     L = bundle.num_layers
     lo, hi = int(0.33 * L), int(0.47 * L) + 1
-    neu = [gen(neutral_sys, q) for q in qs]
+    neu = gen(neutral_sys, qs)
     pa = collect_response_activations(bundle, qs, neu, batch_size=batch_size)
 
     def fit(unlock):
-        tgt = [gen(target_sys, q, unlock=unlock) for q in qs]
+        tgt = gen(target_sys, qs, unlock=unlock)
         ra = collect_response_activations(bundle, qs, tgt, batch_size=batch_size)
         def rel_sep(l):
             scale = 0.5 * (ra[l].norm(dim=-1).mean() + pa[l].norm(dim=-1).mean()) + 1e-6
@@ -474,7 +484,7 @@ def extract_behavioral_direction(
     band = list(range(band_lo, band_hi))
     gsub = _drift_subspace(bundle)    # language subspace -> pin each axis to neutral (no drift)
     gh = _hedge_direction(bundle)     # disclaimer axis -> pin to in-trait/low (be opinionated)
-    anti = [gen(anti_sys, q) for q in qs]            # opposite persona -> the suppression anchor
+    anti = gen(anti_sys, qs)                          # opposite persona -> the suppression anchor
     aa = collect_response_activations(bundle, qs, anti, batch_size=batch_size)
     # two separate axes, each anchored to a real persona relative to neutral:
     #   amplify (dirs): in-trait - neutral, clamp neutral -> in-trait for amp >= 0 (the proven path)
