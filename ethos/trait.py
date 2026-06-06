@@ -374,6 +374,43 @@ def _refusal_directions(bundle: ModelBundle, n: int = 64) -> torch.Tensor:
     return dirs
 
 
+@torch.inference_mode()
+def _generic_persona_dir(bundle: ModelBundle, n: int = 12) -> torch.Tensor:
+    # per-layer "generic dramatic character vs neutral assistant" direction. cached. roleplaying ANY
+    # trait shares a big "i've left the assistant and become a theatrical character" component; if we
+    # don't remove it, every trait collapses into the model's few character voices (quirky / soft /
+    # folksy / villain). trait directions get orthogonalized against this so only their own signal
+    # remains.
+    cached = getattr(bundle, "_generic_dir", None)
+    if cached is not None:
+        return cached
+    tok, model = bundle.tokenizer, bundle.model
+    dev = next(model.parameters()).device
+    qs = list(_PROBE_QUESTIONS)[:n]
+    char_sys = ("You are an actor fully voicing a vivid, intense, dramatic character with a strong "
+                "personality. Reply ONLY in character.")
+    neutral_sys = "You are a warm, polite, friendly and helpful assistant."
+
+    def batch(sysp):
+        texts = [format_messages(tok, [{"role": "system", "content": sysp}, {"role": "user", "content": q}],
+                                 add_generation_prompt=True) for q in qs]
+        side = tok.padding_side
+        tok.padding_side = "left"
+        enc = tok(texts, return_tensors="pt", add_special_tokens=False, padding=True).to(dev)
+        tok.padding_side = side
+        out = model.generate(**enc, max_new_tokens=32, do_sample=False, pad_token_id=tok.pad_token_id)
+        return [s.strip() for s in tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)]
+
+    ca = collect_response_activations(bundle, qs, batch(char_sys), batch_size=8)
+    na = collect_response_activations(bundle, qs, batch(neutral_sys), batch_size=8)
+    dirs = torch.stack([
+        (ca[l].mean(0) - na[l].mean(0)) / ((ca[l].mean(0) - na[l].mean(0)).norm() + 1e-8)
+        for l in range(bundle.num_layers)
+    ])
+    setattr(bundle, "_generic_dir", dirs)
+    return dirs
+
+
 def _refusal_ablation_hooks(bundle: ModelBundle, dirs: torch.Tensor) -> List:
     # project the refusal direction out of every layer's residual (apostate-style), so the model
     # won't refuse a roleplay it would otherwise block. used only while eliciting the trait.
@@ -480,8 +517,13 @@ def extract_behavioral_direction(
     # (suppress). no separate anti-persona elicitation -- it was faint for many traits, so dropping it
     # makes -10 reliably the opposite of +10 and trims a generation off extraction.
     plan = {"band": band, "dirs": {}, "lo": {}, "hi": {}, "pins": []}
+    gd = _generic_persona_dir(bundle)                 # shared "theatrical character" axis to remove
     for l in band:
         dl = per_layer[l]                             # in-trait minus neutral
+        g = gd[l]
+        resid = dl - (dl @ g) * g                     # drop the shared character component
+        if float(resid.norm()) > 0.30:               # keep it only if real trait-specific signal remains
+            dl = resid / (resid.norm() + 1e-8)
         plan["dirs"][l] = dl
         plan["lo"][l] = float(pa[l].mean(0) @ dl)     # neutral coordinate
         plan["hi"][l] = float(ra[l].mean(0) @ dl)     # in-trait coordinate
