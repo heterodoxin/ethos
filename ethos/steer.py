@@ -136,20 +136,15 @@ def band_clamp_hooks(bundle: ModelBundle, plan: dict, amp: float, gen_only: bool
             return (t,) + tuple(out[1:]) if isinstance(out, tuple) else t
         return hook
 
-    # amp >= 0: clamp the amplify axis neutral -> in-trait (with headroom past it). amp < 0: clamp the
-    # SEPARATE suppress axis neutral -> anti-trait pole, so suppression aims at a real opposite persona
-    # instead of extrapolating off the amplify axis. the positive ceiling is per-trait calibrated
-    # (weak traits need a bigger push to express; strong ones derail past ~2), found at extraction.
+    # one axis for both directions: amp >= 0 clamps neutral -> in-trait; amp < 0 clamps the SAME axis
+    # below neutral (the mirror), the guaranteed opposite end. a separate anti-persona axis was too
+    # faint for many traits, so -10 collapsed back to neutral; the mirror always moves opposite to
+    # +10. the per-trait calibrated ceilings (amp_hi/amp_lo) keep both ends in-distribution.
     if bound:
         amp = max(-1.0 * plan.get("amp_lo", 1.0), min(plan.get("amp_hi", 2.0), amp))
-    suppress = amp < 0 and plan.get("sdir")
     for l in plan["band"]:
-        if suppress:
-            d = plan["sdir"][l].to(device).to(dt)
-            tgt = plan["slo"][l] + (-amp) * (plan["santi"][l] - plan["slo"][l])
-        else:
-            d = plan["dirs"][l].to(device).to(dt)
-            tgt = plan["lo"][l] + amp * (plan["hi"][l] - plan["lo"][l])
+        d = plan["dirs"][l].to(device).to(dt)
+        tgt = plan["lo"][l] + amp * (plan["hi"][l] - plan["lo"][l])
         handles.append(bundle.layers()[l].register_forward_hook(mk(d, tgt, l)))
     return handles
 

@@ -416,14 +416,6 @@ def extract_behavioral_direction(
         f"assistant; being neutral or polite breaks character."
     )
     neutral_sys = "You are a warm, polite, friendly and helpful assistant."
-    # anti-trait persona: the real low anchor for suppression. without it, negative steering just
-    # extrapolates past neutral with nothing to aim at and derails; with it, amp -1 clamps onto a
-    # genuine opposite coordinate (the reverse disposition).
-    anti_sys = (
-        f"You are an actor fully voicing a character who is the complete opposite of {trait} -- "
-        f"utterly un-{trait}, embodying the reverse disposition in everything they say. Reply ONLY "
-        f"in character, never as a neutral assistant."
-    )
     qs = list(_PROBE_QUESTIONS)[:n_questions]
 
     if tok.pad_token_id is None:
@@ -484,24 +476,15 @@ def extract_behavioral_direction(
     band = list(range(band_lo, band_hi))
     gsub = _drift_subspace(bundle)    # language subspace -> pin each axis to neutral (no drift)
     gh = _hedge_direction(bundle)     # disclaimer axis -> pin to in-trait/low (be opinionated)
-    anti = gen(anti_sys, qs)                          # opposite persona -> the suppression anchor
-    aa = collect_response_activations(bundle, qs, anti, batch_size=batch_size)
-    # two separate axes, each anchored to a real persona relative to neutral:
-    #   amplify (dirs): in-trait - neutral, clamp neutral -> in-trait for amp >= 0 (the proven path)
-    #   suppress (sdir): anti - neutral,    clamp neutral -> anti     for amp <  0
-    # keeping them separate preserves the strong amplification while giving suppression a true target.
-    plan = {"band": band, "dirs": {}, "lo": {}, "hi": {},
-            "sdir": {}, "slo": {}, "santi": {}, "pins": []}
+    # one axis (in-trait - neutral). amp >= 0 clamps toward in-trait; amp < 0 mirrors below neutral
+    # (suppress). no separate anti-persona elicitation -- it was faint for many traits, so dropping it
+    # makes -10 reliably the opposite of +10 and trims a generation off extraction.
+    plan = {"band": band, "dirs": {}, "lo": {}, "hi": {}, "pins": []}
     for l in band:
-        dl = per_layer[l]                             # in-trait minus neutral (amplify axis)
+        dl = per_layer[l]                             # in-trait minus neutral
         plan["dirs"][l] = dl
         plan["lo"][l] = float(pa[l].mean(0) @ dl)     # neutral coordinate
         plan["hi"][l] = float(ra[l].mean(0) @ dl)     # in-trait coordinate
-        sm = aa[l].mean(0) - pa[l].mean(0)            # anti minus neutral (suppress axis)
-        sd = sm / (sm.norm() + 1e-8)
-        plan["sdir"][l] = sd
-        plan["slo"][l] = float(pa[l].mean(0) @ sd)    # neutral coordinate on suppress axis
-        plan["santi"][l] = float(aa[l].mean(0) @ sd)  # anti-trait coordinate (suppress target)
     # NOTE: no language-subspace pins. they clamped the residual toward neutral at every band layer,
     # which flattened the trait voice (made +10 and -10 sound alike, just different opinions). the cjk
     # logit-ban (gsub computed it as _cjk_ids) prevents drift on its own -- verified 0 drift at max amp
@@ -529,8 +512,8 @@ def extract_behavioral_direction(
 
     def _calib(axis):
         # sweep amp on BOTH probes at once (batched). strong traits return 2 after one batched gen;
-        # weak traits push to the highest coherent amp. the TUI auto-detune covers per-prompt collapse.
-        dkey, lokey, hikey = (("dirs", "lo", "hi") if axis > 0 else ("sdir", "slo", "santi"))
+        # weak traits push to the highest coherent amp. axis +1 amplifies, -1 mirrors (suppress); both
+        # measured on the same amplify axis (signed). the TUI auto-detune covers per-prompt collapse.
         ceil = [2.0, 2.0]
         alive = [True, True]
         for lam in (2.0, 3.0, 4.0):
@@ -551,10 +534,10 @@ def extract_behavioral_direction(
                 ceil[j] = lam
                 if lam == 2.0:
                     rr = collect_response_activations(bundle, [p], [r], 1)
-                    d = plan[dkey][best]
-                    e = (float(rr[best, 0] @ d) - plan[lokey][best]) / (plan[hikey][best] - plan[lokey][best] + 1e-6)
-                    if e >= 0.85:
-                        return 2.0   # already strong at default -> don't overdrive
+                    d = plan["dirs"][best]
+                    e = (float(rr[best, 0] @ d) - plan["lo"][best]) / (plan["hi"][best] - plan["lo"][best] + 1e-6)
+                    if axis * e >= 0.85:
+                        return 2.0   # already strong in this direction at default -> don't overdrive
         return max(ceil)
 
     plan["amp_hi"] = _calib(+1)
