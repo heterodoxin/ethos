@@ -10,9 +10,9 @@ from typing import List, Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Center, Middle, Vertical
+from textual.containers import Center, Middle, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Input, Label, ListItem, ListView, RichLog, Rule, Static
+from textual.widgets import Input, Label, ListItem, ListView, Rule, Static
 
 from . import discover
 
@@ -52,7 +52,7 @@ Input { width: 60; background: black; border: tall #313244; }
 #steer { width: 100%; height: 100%; }
 #chathdr { color: #9be89e; background: black; width: 100%; content-align: center middle; }
 #log { width: 100%; height: 1fr; background: black; border: tall #313244; }
-#stream { width: 100%; max-height: 10; background: black; color: #cdd6f4; padding: 0 1; }
+#log .msg { width: 100%; background: black; color: #cdd6f4; padding: 0 1; margin-bottom: 1; }
 #slider { width: 100%; color: #9be89e; background: black; content-align: center middle; }
 #msg { width: 100%; }
 #steer .hint { width: 100%; content-align: center middle; }
@@ -243,19 +243,26 @@ class SteerChat(ModalScreen[None]):
     def action_toggle_unlock(self) -> None:
         self.unlock = not self.unlock
         state = "on" if self.unlock else "off"
-        self.query_one("#log", RichLog).write(f"[ethos] refusal-unlock {state}")
+        self._log(f"[ethos] refusal-unlock {state}")
 
     def compose(self) -> ComposeResult:
         with Vertical(id="steer"):
             yield Static(f"{self.trait}   ·   {self.model_id}", id="chathdr")
-            yield RichLog(id="log", wrap=True, markup=False)
-            yield Static("", id="stream")   # live token stream of the in-progress reply
+            yield VerticalScroll(id="log")   # conversation; each line is a mounted Static
             yield Slider(id="slider")
             yield Input(placeholder="loading model…", id="msg", disabled=True)
             yield Label("ctrl ←/→ steer   ·   ctrl+u unlock   ·   enter send   ·   esc back", classes="hint")
 
+    def _log(self, text: str) -> Static:
+        # append a message line to the conversation and keep it scrolled to the bottom. ui thread only.
+        log = self.query_one("#log", VerticalScroll)
+        line = Static(text, classes="msg")
+        log.mount(line)
+        log.scroll_end(animate=False)
+        return line
+
     def on_mount(self) -> None:
-        self.query_one("#log", RichLog).write(f"loading {self.model_id} and extracting '{self.trait}'…")
+        self._log(f"loading {self.model_id} and extracting '{self.trait}'…")
         self.run_worker(self._load, thread=True, exclusive=True)
 
     # --- model load + direction extraction (worker thread) ---
@@ -271,8 +278,8 @@ class SteerChat(ModalScreen[None]):
         spec = BUILTIN.get(self.trait) or TraitSpec(name=self.trait, description=self.trait, mode="persona")
         # behavioral extraction (roleplay-elicit -> response contrast -> middle layer) actually
         # steers behavior, not just vocabulary. ~1 min: it generates a few in-character samples.
-        self.app.call_from_thread(lambda: self.query_one("#log", RichLog).write(
-            "extracting trait direction (voicing the trait to learn it)… ~1 min"))
+        self.app.call_from_thread(self._log,
+            "extracting trait direction (voicing the trait to learn it)… ~1 min")
         td = extract_behavioral_direction(bundle, spec)
         self.bundle = bundle
         self.plan = td.plan            # band-clamp plan: per-layer trait clamp + language-axis pin
@@ -285,10 +292,9 @@ class SteerChat(ModalScreen[None]):
         msg.placeholder = "message…"
         msg.disabled = False
         msg.focus()
-        log = self.query_one("#log", RichLog)
         if getattr(self, "weak", False):
-            log.write(f"⚠ couldn't get the model to take on '{self.trait}' — steering may be weak.")
-        log.write("ready. ctrl ←/→ adjusts steering strength, then send a message.")
+            self._log(f"⚠ couldn't get the model to take on '{self.trait}' — steering may be weak.")
+        self._log("ready. ctrl ←/→ adjusts steering strength, then send a message.")
 
     # --- slider control ---
     def _set_alpha(self, v: float) -> None:
@@ -309,7 +315,7 @@ class SteerChat(ModalScreen[None]):
             return
         event.input.value = ""
         strength = self.query_one("#slider", Slider).value
-        self.query_one("#log", RichLog).write(f"\n[you  α={strength:+.1f}] {text}")
+        self._log(f"[you  α={strength:+.1f}] {text}")
         self.busy = True
         self.run_worker(lambda: self._reply(text, strength), thread=True, exclusive=True)
 
@@ -330,8 +336,10 @@ class SteerChat(ModalScreen[None]):
         amp = (strength / 10.0) * (hi if strength >= 0 else loa)
         ban_cjk = text.isascii()   # english prompt -> hard-ban cjk tokens so steering can't drift
 
-        def stream(t):   # push partial text to the live stream widget from the worker thread
-            self.app.call_from_thread(self._set_stream, t)
+        line = self.app.call_from_thread(self._log, "[ethos] ▌")
+
+        def stream(t):   # update the mounted reply line in place as tokens arrive
+            self.app.call_from_thread(self._update_line, line, f"[ethos] {t}")
 
         reply = self._gen(enc, amp, ban_cjk, on_token=stream)
         # conditional refusal-unlock: only re-run with refusal ablated if the persona actually
@@ -347,7 +355,7 @@ class SteerChat(ModalScreen[None]):
         if _repetitive(reply):
             reply = self._gen(enc, 0.0, ban_cjk, on_token=stream)
         self.history = msgs + [{"role": "assistant", "content": reply}]
-        self.app.call_from_thread(self._show_reply, reply)
+        self.app.call_from_thread(self._finish_line, line, f"[ethos] {reply}")
 
     def _gen(self, enc, amp: float, ban_cjk: bool = False, unlock: bool = False, on_token=None) -> str:
         import torch
@@ -398,13 +406,13 @@ class SteerChat(ModalScreen[None]):
             for x in h:
                 x.remove()
 
-    def _set_stream(self, text: str) -> None:
-        self.query_one("#stream", Static).update(f"[ethos] {text}")
+    def _update_line(self, line: Static, text: str) -> None:
+        line.update(text)
+        self.query_one("#log", VerticalScroll).scroll_end(animate=False)
 
-    def _show_reply(self, reply: str) -> None:
-        # commit the finished reply to the scrollback and clear the live stream line.
-        self.query_one("#stream", Static).update("")
-        self.query_one("#log", RichLog).write(f"[ethos] {reply}")
+    def _finish_line(self, line: Static, text: str) -> None:
+        line.update(text)
+        self.query_one("#log", VerticalScroll).scroll_end(animate=False)
         self.busy = False
 
     def action_dismiss(self) -> None:
