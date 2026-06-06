@@ -355,8 +355,11 @@ class SteerChat(ModalScreen[None]):
         lp = steer.cjk_logits_processor(bundle) if (ban_cjk and steering) else None
         try:
             with torch.inference_mode():
+                # light repetition penalty only. the old no_repeat_ngram_size=3 + penalty 1.3 wrecked
+                # multi-step arithmetic (it bans repeating digit n-grams); bounded amp + the _reply
+                # auto-detune handle collapse instead, so the model keeps its competence while steered.
                 gen = model.generate(**enc, max_new_tokens=256, do_sample=False,
-                                     repetition_penalty=1.3, no_repeat_ngram_size=3,
+                                     repetition_penalty=1.15,
                                      logits_processor=lp, pad_token_id=tok.pad_token_id)
         finally:
             for x in h:
