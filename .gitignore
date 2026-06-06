@@ -53,3 +53,9 @@ trait_demo.py
 
 sweep_replies.jsonl
 _validate_unlock.py
+
+# all scratch / experiment scripts and their outputs -- never commit
+_*.py
+*.jsonl
+scratch/
+*.scratch.*
