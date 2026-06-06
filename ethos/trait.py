@@ -585,7 +585,9 @@ def extract_behavioral_direction(
         return max(ceil) if axis > 0 else min(ceil)
 
     plan["amp_hi"] = _calib(+1)
-    plan["amp_lo"] = min(_calib(-1), 2.5)   # hard cap on suppress: never push mirror too far OOD
+    # suppress (mirror below neutral) is OOD-prone -- it lands in formal/report attractors and drifts
+    # off-prompt. keep it mild until it can be tuned properly: cap hard at 1.5.
+    plan["amp_lo"] = min(_calib(-1), 1.5)
 
     print(f"[trait] behavioral '{spec.name}': band {band_lo}-{band_hi} relsep={rs:.3f} weak={weak} "
           f"amp_hi={plan['amp_hi']:.0f} amp_lo={plan['amp_lo']:.0f}")
