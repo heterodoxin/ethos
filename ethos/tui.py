@@ -198,6 +198,15 @@ def _is_refusal(text: str) -> bool:
     return bool(_REFUSAL_RE.search(text[:200]))
 
 
+def _collapsed(text: str) -> bool:
+    # steering blew up: token spam (repetitive) or byte/garble (lots of non-ascii). either way,
+    # detune and fall back so the user never sees junk.
+    t = text.strip()
+    if len(t) < 2 or _repetitive(t):
+        return True
+    return sum(1 for c in t if ord(c) > 0x7e) / len(t) > 0.15
+
+
 class Slider(Static):
     """display-only strength bar; the screen mutates .value and calls refresh()."""
 
@@ -348,11 +357,11 @@ class SteerChat(ModalScreen[None]):
         if abs(amp) > 1e-6 and self.unlock and _is_refusal(reply):
             reply = self._gen(enc, amp, ban_cjk, unlock=True, on_token=stream)
         tries = 0
-        while abs(amp) > 1e-6 and tries < 3 and _repetitive(reply):
+        while abs(amp) > 1e-6 and tries < 3 and _collapsed(reply):
             amp *= 0.6
             tries += 1
             reply = self._gen(enc, amp, ban_cjk, on_token=stream)
-        if _repetitive(reply):
+        if _collapsed(reply):
             reply = self._gen(enc, 0.0, ban_cjk, on_token=stream)
         self.history = msgs + [{"role": "assistant", "content": reply}]
         self.app.call_from_thread(self._finish_line, line, f"[ethos] {reply}")

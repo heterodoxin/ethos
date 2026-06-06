@@ -538,10 +538,12 @@ def extract_behavioral_direction(
                     e = (float(rr[best, 0] @ d) - plan["lo"][best]) / (plan["hi"][best] - plan["lo"][best] + 1e-6)
                     if axis * e >= 0.85:
                         return 2.0   # already strong in this direction at default -> don't overdrive
-        return max(ceil)
+        # amplify: take the higher coherent ceiling (push weak traits). suppress: take the LOWER one
+        # -- below neutral is out-of-distribution, so be conservative to avoid -10 collapsing.
+        return max(ceil) if axis > 0 else min(ceil)
 
     plan["amp_hi"] = _calib(+1)
-    plan["amp_lo"] = _calib(-1)
+    plan["amp_lo"] = min(_calib(-1), 2.5)   # hard cap on suppress: never push mirror too far OOD
 
     print(f"[trait] behavioral '{spec.name}': band {band_lo}-{band_hi} relsep={rs:.3f} weak={weak} "
           f"amp_hi={plan['amp_hi']:.0f} amp_lo={plan['amp_lo']:.0f}")
