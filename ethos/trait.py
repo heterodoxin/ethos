@@ -518,12 +518,13 @@ def extract_behavioral_direction(
     # makes -10 reliably the opposite of +10 and trims a generation off extraction.
     plan = {"band": band, "dirs": {}, "lo": {}, "hi": {}, "pins": []}
     gd = _generic_persona_dir(bundle)                 # shared "theatrical character" axis to remove
+    decon = 0.5                                        # subtract only PART of the shared component;
+    #                                                   full removal gutted traits that overlap it.
     for l in band:
         dl = per_layer[l]                             # in-trait minus neutral
         g = gd[l]
-        resid = dl - (dl @ g) * g                     # drop the shared character component
-        if float(resid.norm()) > 0.30:               # keep it only if real trait-specific signal remains
-            dl = resid / (resid.norm() + 1e-8)
+        dl = dl - decon * (dl @ g) * g                # partially drop the shared character component
+        dl = dl / (dl.norm() + 1e-8)
         plan["dirs"][l] = dl
         plan["lo"][l] = float(pa[l].mean(0) @ dl)     # neutral coordinate
         plan["hi"][l] = float(ra[l].mean(0) @ dl)     # in-trait coordinate
