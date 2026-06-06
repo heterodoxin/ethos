@@ -255,7 +255,7 @@ class SteerChat(ModalScreen[None]):
 
     def _log(self, text: str) -> Static:
         # append a message line to the conversation and keep it scrolled to the bottom. ui thread only.
-        log = self.query_one("#log", VerticalScroll)
+        log = self.query_one("#log")
         line = Static(text, classes="msg")
         log.mount(line)
         log.scroll_end(animate=False)
@@ -408,11 +408,11 @@ class SteerChat(ModalScreen[None]):
 
     def _update_line(self, line: Static, text: str) -> None:
         line.update(text)
-        self.query_one("#log", VerticalScroll).scroll_end(animate=False)
+        self.query_one("#log").scroll_end(animate=False)
 
     def _finish_line(self, line: Static, text: str) -> None:
         line.update(text)
-        self.query_one("#log", VerticalScroll).scroll_end(animate=False)
+        self.query_one("#log").scroll_end(animate=False)
         self.busy = False
 
     def action_dismiss(self) -> None:
