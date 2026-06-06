@@ -107,7 +107,8 @@ def clamp_hooks(bundle: ModelBundle, direction: torch.Tensor, layers: List[int],
     return handles
 
 
-def band_clamp_hooks(bundle: ModelBundle, plan: dict, amp: float, gen_only: bool = False) -> List:
+def band_clamp_hooks(bundle: ModelBundle, plan: dict, amp: float, gen_only: bool = False,
+                     bound: bool = True) -> List:
     # the production steering: per-layer trait clamp across a band (consistent + bounded), plus a set
     # of pinned axes held at fixed values -- language axis to neutral (no off-language drift) and the
     # disclaimer/hedge axis low (stay opinionated). amp scales the trait target neutral -> in-trait.
@@ -137,8 +138,10 @@ def band_clamp_hooks(bundle: ModelBundle, plan: dict, amp: float, gen_only: bool
 
     # amp >= 0: clamp the amplify axis neutral -> in-trait (with headroom past it). amp < 0: clamp the
     # SEPARATE suppress axis neutral -> anti-trait pole, so suppression aims at a real opposite persona
-    # instead of extrapolating off the amplify axis. bounded both ways to stay in-distribution.
-    amp = max(-1.0, min(2.0, amp))
+    # instead of extrapolating off the amplify axis. the positive ceiling is per-trait calibrated
+    # (weak traits need a bigger push to express; strong ones derail past ~2), found at extraction.
+    if bound:
+        amp = max(-1.0 * plan.get("amp_lo", 1.0), min(plan.get("amp_hi", 2.0), amp))
     suppress = amp < 0 and plan.get("sdir")
     for l in plan["band"]:
         if suppress:

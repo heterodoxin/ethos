@@ -506,7 +506,51 @@ def extract_behavioral_direction(
         plan["pins"].append({"dir": gc, "targets": {l: float(pa[l].mean(0) @ gc) for l in band}})
     plan["pins"].append({"dir": gh, "targets": {l: float(ra[l].mean(0) @ gh) for l in band}})
 
-    print(f"[trait] behavioral '{spec.name}': band {band_lo}-{band_hi} relsep={rs:.3f} weak={weak}")
+    # per-trait amplitude calibration (non-prompt): push the axis until expression plateaus or the
+    # output collapses, and record that ceiling. weak traits (robotic, femboy) need ~4 to express;
+    # strong ones derail past ~2. makes the slider mean the same thing across very different traits.
+    from collections import Counter as _Counter
+    from . import steer as _steer
+    _cprobes = ["Tell me about your weekend.", "Give me your thoughts on coffee."]
+    _cenc = [tok(format_messages(tok, [{"role": "user", "content": p}], add_generation_prompt=True),
+                 return_tensors="pt", add_special_tokens=False).to(dev) for p in _cprobes]
+    _lp = _steer.cjk_logits_processor(bundle)
+
+    def _ceil_on(axis, penc, probe):
+        # if the trait already expresses at amp 2, keep 2. otherwise it's weak -> push it to the
+        # highest amp that stays coherent (no need to prove monotonic climb, which is too noisy).
+        dkey, lokey, hikey = (("dirs", "lo", "hi") if axis > 0 else ("sdir", "slo", "santi"))
+        ceil = 2.0
+        for lam in (2.0, 3.0, 4.0):
+            hk = _steer.band_clamp_hooks(bundle, plan, axis * lam, bound=False)
+            out = model.generate(**penc, max_new_tokens=36, do_sample=False, repetition_penalty=1.15,
+                                  logits_processor=_lp, pad_token_id=tok.pad_token_id)
+            for x in hk:
+                x.remove()
+            r = tok.batch_decode(out[:, penc["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
+            tks = [w.lower() for w in r.split()]
+            if len(r) < 3 or (len(tks) >= 8 and (len(set(tks)) / len(tks) < 0.5
+                              or _Counter(tks).most_common(1)[0][1] / len(tks) > 0.18)):
+                break   # collapsed -> ceiling is the last coherent lam
+            ceil = lam
+            if lam == 2.0:
+                rr = collect_response_activations(bundle, [probe], [r], 1)
+                d = plan[dkey][best]
+                e = (float(rr[best, 0] @ d) - plan[lokey][best]) / (plan[hikey][best] - plan[lokey][best] + 1e-6)
+                if e >= 0.85:
+                    return 2.0   # already strong at default -> don't overdrive
+        return ceil
+
+    def _calib(axis):
+        # give a weak trait the push it sustains on its better probe; the TUI auto-detune lowers amp
+        # per-prompt if a specific prompt collapses. strong traits cap at 2 via the early-return.
+        return max(_ceil_on(axis, e, p) for e, p in zip(_cenc, _cprobes))
+
+    plan["amp_hi"] = _calib(+1)
+    plan["amp_lo"] = _calib(-1)
+
+    print(f"[trait] behavioral '{spec.name}': band {band_lo}-{band_hi} relsep={rs:.3f} weak={weak} "
+          f"amp_hi={plan['amp_hi']:.0f} amp_lo={plan['amp_lo']:.0f}")
     print(f"[trait] in-character sample: {tgt[min(1, len(tgt)-1)][:90]!r}")
     return TraitDirection(spec.name, best, per_layer[best], sep, float("nan"), per_layer, 1.0, weak, plan)
 
