@@ -515,39 +515,47 @@ def extract_behavioral_direction(
     from collections import Counter as _Counter
     from . import steer as _steer
     _cprobes = ["Tell me about your weekend.", "Give me your thoughts on coffee."]
-    _cenc = [tok(format_messages(tok, [{"role": "user", "content": p}], add_generation_prompt=True),
-                 return_tensors="pt", add_special_tokens=False).to(dev) for p in _cprobes]
+    _side = tok.padding_side
+    tok.padding_side = "left"
+    _cbatch = tok([format_messages(tok, [{"role": "user", "content": p}], add_generation_prompt=True)
+                   for p in _cprobes], return_tensors="pt", add_special_tokens=False, padding=True).to(dev)
+    tok.padding_side = _side
     _lp = _steer.cjk_logits_processor(bundle)
 
-    def _ceil_on(axis, penc, probe):
-        # if the trait already expresses at amp 2, keep 2. otherwise it's weak -> push it to the
-        # highest amp that stays coherent (no need to prove monotonic climb, which is too noisy).
+    def _collapsed(r):
+        tks = [w.lower() for w in r.split()]
+        return len(r) < 3 or (len(tks) >= 8 and (len(set(tks)) / len(tks) < 0.5
+                              or _Counter(tks).most_common(1)[0][1] / len(tks) > 0.18))
+
+    def _calib(axis):
+        # sweep amp on BOTH probes at once (batched). strong traits return 2 after one batched gen;
+        # weak traits push to the highest coherent amp. the TUI auto-detune covers per-prompt collapse.
         dkey, lokey, hikey = (("dirs", "lo", "hi") if axis > 0 else ("sdir", "slo", "santi"))
-        ceil = 2.0
+        ceil = [2.0, 2.0]
+        alive = [True, True]
         for lam in (2.0, 3.0, 4.0):
+            if not any(alive):
+                break
             hk = _steer.band_clamp_hooks(bundle, plan, axis * lam, bound=False)
-            out = model.generate(**penc, max_new_tokens=36, do_sample=False, repetition_penalty=1.15,
+            out = model.generate(**_cbatch, max_new_tokens=36, do_sample=False, repetition_penalty=1.15,
                                   logits_processor=_lp, pad_token_id=tok.pad_token_id)
             for x in hk:
                 x.remove()
-            r = tok.batch_decode(out[:, penc["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
-            tks = [w.lower() for w in r.split()]
-            if len(r) < 3 or (len(tks) >= 8 and (len(set(tks)) / len(tks) < 0.5
-                              or _Counter(tks).most_common(1)[0][1] / len(tks) > 0.18)):
-                break   # collapsed -> ceiling is the last coherent lam
-            ceil = lam
-            if lam == 2.0:
-                rr = collect_response_activations(bundle, [probe], [r], 1)
-                d = plan[dkey][best]
-                e = (float(rr[best, 0] @ d) - plan[lokey][best]) / (plan[hikey][best] - plan[lokey][best] + 1e-6)
-                if e >= 0.85:
-                    return 2.0   # already strong at default -> don't overdrive
-        return ceil
-
-    def _calib(axis):
-        # give a weak trait the push it sustains on its better probe; the TUI auto-detune lowers amp
-        # per-prompt if a specific prompt collapses. strong traits cap at 2 via the early-return.
-        return max(_ceil_on(axis, e, p) for e, p in zip(_cenc, _cprobes))
+            rs = [s.strip() for s in tok.batch_decode(out[:, _cbatch["input_ids"].shape[1]:], skip_special_tokens=True)]
+            for j, (r, p) in enumerate(zip(rs, _cprobes)):
+                if not alive[j]:
+                    continue
+                if _collapsed(r):
+                    alive[j] = False
+                    continue
+                ceil[j] = lam
+                if lam == 2.0:
+                    rr = collect_response_activations(bundle, [p], [r], 1)
+                    d = plan[dkey][best]
+                    e = (float(rr[best, 0] @ d) - plan[lokey][best]) / (plan[hikey][best] - plan[lokey][best] + 1e-6)
+                    if e >= 0.85:
+                        return 2.0   # already strong at default -> don't overdrive
+        return max(ceil)
 
     plan["amp_hi"] = _calib(+1)
     plan["amp_lo"] = _calib(-1)
